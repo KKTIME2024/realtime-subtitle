@@ -55,3 +55,6 @@ scratch/
 
 # Claude helper directories
 .claude/
+
+# Rust overlay crate build output
+vr_overlay/target/
