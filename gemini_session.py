@@ -983,7 +983,7 @@ class GeminiSession:
         if ipc_server and hasattr(ipc_server, "broadcast_foreign_speech"):
             try:
                 detected_lang = self._infer_source_language(original_tokens)
-                asyncio.create_task(ipc_server.broadcast_foreign_speech(source, detected_lang))
+                asyncio.create_task(ipc_server.broadcast_foreign_speech(source, detected_lang, translation))
             except Exception as e:
                 print(f"⚠️ [IPC] Failed to fire-and-forget broadcast: {e}")
 

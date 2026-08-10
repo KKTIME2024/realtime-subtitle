@@ -715,6 +715,9 @@ def main():
     _seed_mod.ipc_server = ipc_server
     web_server.ipc_server = ipc_server
 
+    # VR 浮层作为 ForeignSpeech 事件订阅者 (可选; 无 VR_OVERLAY_ENABLED 时由 commit 3 控制)
+    ipc_server.vr_overlay = web_server.vr_overlay
+
     provider_manager.web_server = web_server
 
     def apply_window_on_top_fallback(on_top: bool) -> bool:
