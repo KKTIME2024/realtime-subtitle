@@ -396,7 +396,7 @@
             auto_sleep_setting: '自动休眠',
             auto_sleep_enabled: '开启',
             auto_sleep_disabled: '关闭',
-            vr_overlay_setting: 'VR 悬浮窗',
+            vr_overlay_setting: 'VR 浮层',
             vr_overlay_enabled: '开启',
             vr_overlay_disabled: '关闭',
             speaker_labels_setting: '说话人标签',

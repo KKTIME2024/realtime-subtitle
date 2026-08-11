@@ -373,6 +373,11 @@ class WebServer:
             ),
             "interrupt_repair_enabled": bool(config.SONIOX_INTERRUPT_REPAIR_ENABLED),
             "sleep_on_silence_enabled": config.get_sleep_on_silence_enabled(provider),
+            # VR 浮层真实状态 (开关初始值以此为准, 防 localStorage 与后端脱节)。
+            "vr_overlay_enabled": (
+                getattr(self, "vr_overlay_manager", None) is not None
+                and self.vr_overlay_manager.status not in ("stopped", "crashed")
+            ),
             "soniox_region": config.SONIOX_REGION,
             "soniox_custom_url": bool(config.SONIOX_CUSTOM_URL),
             # Subtitle-server relay (hosted mode) availability. The server URL is
