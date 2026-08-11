@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::bridge::{BridgeClient, BridgeError, OverlayBridgeEvent};
 use crate::logging::OverlayLogger;
 use crate::manifest::{self, OverlayManifest};
-use crate::openvr::{self, OpenVrOverlay};
+use crate::openvr::{self, OpenVrOverlay, OverlayFrameSubmitter};
 use crate::renderer::{
     CaptionBlock, CaptionBlockVariant, CaptionChannel, CaptionRenderer, CaptionRenderError,
 };
@@ -185,6 +185,7 @@ pub struct OverlayRuntime {
     ready_sent: bool,
     stopped: bool,
     redraw_requested: bool,
+    calibration_pending: bool,
     overlay_visible: bool,
     idle_hide_pending_since: Option<Instant>,
     entry_counter: u64,
@@ -199,6 +200,7 @@ impl OverlayRuntime {
             ready_sent: false,
             stopped: false,
             redraw_requested: true,
+            calibration_pending: false,
             overlay_visible: false,
             idle_hide_pending_since: None,
             entry_counter: 0,
@@ -255,6 +257,7 @@ impl OverlayRuntime {
         let new_cal = snapshot.calibration.to_overlay_calibration();
         if self.state.calibration() != &new_cal {
             self.state.set_calibration(new_cal);
+            self.calibration_pending = true;
             visual_changed = true;
             redraw_requested = true;
         }
@@ -567,6 +570,11 @@ impl OverlayRuntime {
         bridge: &mut BridgeClient,
         logger: &OverlayLogger,
     ) -> Result<(), RuntimeFailure> {
+        // 校准变更要落到 OpenVR 变换 (否则浮层停在视野正中)。
+        if self.calibration_pending {
+            submitter.apply_calibration(self.state.calibration())?;
+            self.calibration_pending = false;
+        }
         if self.redraw_requested {
             self.submit_frame_if_needed(renderer, submitter, bridge, logger)
                 .await?;
@@ -885,6 +893,10 @@ impl OverlayRuntime {
         // ready-emission path lives in `submit_frame_if_needed`, which reads
         // the id from runtime state (set below) — no hardcoded-id trap.
         self.set_instance_id(overlay_instance_id);
+        // 启动即应用初始校准 (首个快照到达前位置就正确)。
+        overlay
+            .apply_calibration(&self.state.calibration())
+            .map_err(|e| StartupError::OpenVr(e.to_string()))?;
         let mut submitter = ShellSubmitter(&mut overlay);
         self.submit_frame_if_needed(renderer, &mut submitter, bridge, logger)
             .await
@@ -913,6 +925,13 @@ impl crate::openvr::OverlayFrameSubmitter for ShellSubmitter<'_> {
 
     fn set_overlay_visible(&mut self, visible: bool) -> Result<(), crate::openvr::OpenVrError> {
         self.0.set_overlay_visible(visible)
+    }
+
+    fn apply_calibration(
+        &mut self,
+        calibration: &crate::state::OverlayCalibration,
+    ) -> Result<(), crate::openvr::OpenVrError> {
+        self.0.apply_calibration(calibration)
     }
 }
 

@@ -11,7 +11,7 @@ use rinbridge_overlay::runtime::SnapshotApplyOutcome;
 use rinbridge_overlay::{
     run_with_manifest, submit_texture, validate_manifest, BridgeClient, CaptionBlock,
     CaptionChannel, CaptionRenderer, FakeOpenVr, OpenVrError, OverlayBridgeEvent,
-    OverlayFrameSubmitter, OverlayLoggingMode, OverlayManifest, OverlayPresentationBlock,
+    OverlayCalibration, OverlayFrameSubmitter, OverlayLoggingMode, OverlayManifest, OverlayPresentationBlock,
     OverlayPresentationBlockVariant, OverlayPresentationCalibration, OverlayPresentationSnapshot,
     OverlayRuntime, RenderedFrame, RuntimeFailure, StartupError, EXPECTED_CONTRACT_VERSION,
 };
@@ -251,6 +251,7 @@ struct RecordingSubmitter {
     operations: Vec<&'static str>,
     visibility_changes: Vec<bool>,
     last_visible: Option<bool>,
+    applied_calibrations: Vec<f32>,
 }
 
 impl RecordingSubmitter {
@@ -261,6 +262,7 @@ impl RecordingSubmitter {
             operations: Vec::new(),
             visibility_changes: Vec::new(),
             last_visible: None,
+            applied_calibrations: Vec::new(),
         }
     }
 }
@@ -286,6 +288,14 @@ impl OverlayFrameSubmitter for RecordingSubmitter {
         self.operations.push(if visible { "show" } else { "hide" });
         self.last_visible = Some(visible);
         self.visibility_changes.push(visible);
+        Ok(())
+    }
+
+    fn apply_calibration(
+        &mut self,
+        calibration: &OverlayCalibration,
+    ) -> Result<(), OpenVrError> {
+        self.applied_calibrations.push(calibration.offset_y);
         Ok(())
     }
 }
@@ -437,6 +447,73 @@ async fn runtime_applies_new_snapshot_calibration_to_state() {
 
     assert_eq!(runtime.state().calibration().distance, 1.2);
     assert_eq!(runtime.state().calibration().background_alpha, 0.4);
+}
+
+#[tokio::test]
+async fn runtime_applies_snapshot_calibration_to_submitter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let _ = ws.next().await; // auth
+        // 首条 = 初始快照 (connect 消费, 默认校准)
+        ws.send(Message::Text(
+            json!({
+                "type": "snapshot",
+                "payload": OverlayPresentationSnapshot {
+                    revision: 0,
+                    calibration: OverlayPresentationCalibration::default(),
+                    blocks: vec![],
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        // 第二条: 校准变化 → 循环内 apply_snapshot → drain_redraw 落 submitter
+        ws.send(Message::Text(
+            json!({
+                "type": "snapshot",
+                "payload": OverlayPresentationSnapshot {
+                    revision: 1,
+                    calibration: OverlayPresentationCalibration {
+                        offset_y: -0.55,
+                        ..Default::default()
+                    },
+                    blocks: vec![],
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"type": "shutdown"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    });
+
+    let mut manifest = test_manifest();
+    manifest.bridge_url = format!("ws://{}", address);
+    let (mut bridge, _initial) = BridgeClient::connect(&manifest).await.unwrap();
+
+    let mut runtime = OverlayRuntime::new(OverlayPresentationSnapshot::default());
+    let mut submitter = RecordingSubmitter::default();
+    let renderer = CaptionRenderer::new_for_test().unwrap();
+    let logger = test_logger("calibration-apply").await;
+
+    runtime
+        .run_event_loop(&mut bridge, &renderer, &mut submitter, &logger)
+        .await
+        .unwrap();
+
+    // 快照的校准必须落到 submitter (OpenVR 变换), 不能只改 state。
+    assert_eq!(submitter.applied_calibrations, vec![-0.55]);
+    server.await.unwrap();
 }
 
 #[tokio::test]
