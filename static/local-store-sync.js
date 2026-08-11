@@ -44,6 +44,7 @@
         'llmTranslationMode': true,
         'llmRefineMode': true,
         'llmRefineEnabled': true,
+        'vrOverlayEnabled': true,
         'sleepOnSilenceEnabled': true,
         'inviteRewardReminderLastShown': true,
         'useBundledCjkFont': true,

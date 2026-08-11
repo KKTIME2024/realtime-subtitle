@@ -105,6 +105,9 @@ class WebServer:
         self._vr_clients = set()
         self.vr_overlay = VROverlay(self._broadcast_vr)
 
+        # VR 浮层进程管理 (由 server.py 注入; None = 未接线)。
+        self.vr_overlay_manager = None
+
     def set_window_on_top_callback(self, callback):
         self.window_on_top_callback = callback
 
@@ -1267,6 +1270,46 @@ class WebServer:
             "effective": bool(effective),
         })
 
+    async def vr_overlay_get_handler(self, request):
+        """VR overlay 开关状态查询。"""
+        manager = getattr(self, "vr_overlay_manager", None)
+        return web.json_response({
+            "enabled": manager is not None and manager.status not in ("stopped", "crashed"),
+            "status": manager.status if manager is not None else "stopped",
+        })
+
+    async def vr_overlay_set_handler(self, request):
+        """热切换 VR overlay: 开 → spawn, 关 → kill。
+
+        优先走 server.py 注入的编排闭包 (互斥: VR 开 → 桌面浮层退出);
+        未接线时回退到 manager 自身。
+        """
+        if not self._is_loopback_request(request):
+            return web.json_response({"status": "error", "message": "localhost only"}, status=403)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+        manager = getattr(self, "vr_overlay_manager", None)
+        if manager is None:
+            return web.json_response({"status": "error", "message": "VR overlay not wired"}, status=400)
+        if payload.get("enabled"):
+            start = getattr(self, "vr_overlay_start", None)
+            if start is not None:
+                start()
+            else:
+                manager.start()
+        else:
+            stop = getattr(self, "vr_overlay_stop", None)
+            if stop is not None:
+                stop()
+            else:
+                manager.close()
+        return web.json_response({
+            "enabled": manager.status not in ("stopped", "crashed"),
+            "status": manager.status,
+        })
+
     def _supports_interrupt_repair(self) -> bool:
         return (
             config.TRANSLATION_PROVIDER == "soniox"
@@ -2046,6 +2089,8 @@ class WebServer:
         app.router.add_get('/', self.index_handler)
         app.router.add_get('/ws', self.websocket_handler)
         app.router.add_get('/vr_ws', self.vr_ws_handler)
+        app.router.add_get('/vr-overlay', self.vr_overlay_get_handler)
+        app.router.add_post('/vr-overlay', self.vr_overlay_set_handler)
         app.router.add_get('/health', self.health_handler)
         app.router.add_get('/local-store', self.local_store_get_handler)
         app.router.add_post('/local-store', self.local_store_post_handler)

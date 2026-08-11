@@ -58,3 +58,7 @@ scratch/
 
 # Rust overlay crate build output
 vr_overlay/target/
+
+# VR overlay runtime artifacts (written to repo root by vr_overlay_manager.py)
+overlay_manifest.json
+overlay-logs/

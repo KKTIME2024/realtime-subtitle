@@ -315,6 +315,11 @@ if TRANSLATION_PROVIDER not in ("soniox", "gemini"):
         print(f"⚠️  Invalid TRANSLATION_PROVIDER: {_TRANSLATION_PROVIDER_RAW}, fallback to: soniox")
     TRANSLATION_PROVIDER = "soniox"
 
+# VR overlay 开关 (Settings 面板热切换; env 只读回退, 照 TRANSLATION_PROVIDER 模式)。
+VR_OVERLAY_ENABLED = _env_bool("VR_OVERLAY_ENABLED", False)
+# RinBridgeOverlay.exe 路径覆盖 (默认 vr_overlay/target/release/RinBridgeOverlay.exe)。
+VR_OVERLAY_EXE = _env_str("VR_OVERLAY_EXE", "")
+
 
 def _provider_sleep_env_names(suffix: str) -> tuple[str, str, str]:
     active_prefix = TRANSLATION_PROVIDER.upper()

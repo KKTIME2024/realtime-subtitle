@@ -11,8 +11,11 @@ import os
 import time
 import queue
 import secrets
+from pathlib import Path
 from dotenv import load_dotenv
 from aiohttp import web
+
+from overlay_manager import DesktopOverlayManager
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -554,67 +557,6 @@ class ProviderManager:
         return result
 
 
-class OverlayManager:
-    """管理原生（PySide6）字幕悬浮窗子进程。
-
-    与 pywebview 主窗口分属不同进程，避免两个 GUI 事件循环冲突。子进程通过
-    WebSocket(`/ws`) 接收字幕，并用 REST(`/pause`,`/resume`) 控制识别。
-    """
-
-    def __init__(self, server_url: str, web_server=None):
-        self.server_url = server_url
-        self.web_server = web_server
-        self._proc = None
-        self.is_visible = False
-
-    def is_open(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
-
-    def _build_command(self, hidden: bool = True) -> list[str]:
-        args = ["--run-overlay", "--url", self.server_url]
-        if hidden:
-            args.append("--hidden")
-        if getattr(sys, "frozen", False):
-            # PyInstaller：重新拉起自身可执行文件，由 main() 顶部分发到 overlay。
-            return [sys.executable, *args]
-        overlay_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlay_window.py")
-        return [sys.executable, overlay_script, *args]
-
-    def open(self, hidden: bool = False) -> bool:
-        if self.is_open():
-            return True
-        import subprocess
-
-        kwargs = {}
-        if os.name == "nt":
-            # 不为悬浮窗弹出额外的控制台窗口。
-            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-        try:
-            self._proc = subprocess.Popen(self._build_command(hidden=hidden), **kwargs)
-        except Exception as error:
-            print(f"⚠️  Failed to launch subtitle overlay: {error}")
-            self._proc = None
-            raise
-        return True
-
-    def prewarm(self):
-        """Pre-warm the overlay process by starting it hidden."""
-        try:
-            self.open(hidden=True)
-        except Exception as e:
-            print(f"⚠️  Failed to pre-warm overlay: {e}")
-
-    def close(self) -> bool:
-        proc = self._proc
-        self._proc = None
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        return False
-
-
 def run_server(app, sock):
     """在单独的线程中运行Web服务器"""
     loop = asyncio.new_event_loop()
@@ -665,6 +607,7 @@ def main():
     from web_server import WebServer
     from ipc_server import IPCServer
     from osc_manager import osc_manager
+    from vr_overlay_manager import VROverlayManager
 
     # 创建日志记录器
     logger = TranscriptLogger()
@@ -909,7 +852,41 @@ def main():
     print(f"🚀 Server starting on {bind_host}:{actual_port}")
 
     # 原生字幕悬浮窗始终走本地回环地址连接，避免依赖 LAN host 解析。
-    web_server.overlay_manager = OverlayManager(f"http://127.0.0.1:{actual_port}", web_server=web_server)
+    web_server.overlay_manager = DesktopOverlayManager(f"http://127.0.0.1:{actual_port}", web_server=web_server)
+
+    # ── VR overlay 管理器 (Settings 开关热切换) ──
+    vr_exe = config.VR_OVERLAY_EXE or str(
+        Path(__file__).resolve().parent / "vr_overlay" / "target" / "release" / "RinBridgeOverlay.exe"
+    )
+    vr_manager = VROverlayManager(
+        bridge_url=f"ws://127.0.0.1:{actual_port}/vr_ws",
+        session_token=web_server.vr_token,
+        exe_path=vr_exe,
+        work_dir=Path(__file__).resolve().parent,
+        parent_pid=os.getpid(),
+    )
+    web_server.vr_overlay_manager = vr_manager
+
+    def _vr_overlay_start() -> bool:
+        ok = vr_manager.start()
+        if ok:
+            # 互斥: VR 开 → 桌面浮层退出 (仅成功拉起后)
+            web_server.overlay_manager.close()
+        return ok
+
+    def _vr_overlay_stop() -> None:
+        vr_manager.close()
+        web_server.overlay_manager.prewarm()
+
+    web_server.vr_overlay_start = _vr_overlay_start
+    web_server.vr_overlay_stop = _vr_overlay_stop
+
+    if config.VR_OVERLAY_ENABLED:
+        _vr_overlay_start()
+    else:
+        # Pre-warm the overlay process by starting it hidden
+        if not getattr(sys, "frozen", False) or "--run-overlay" not in sys.argv:
+            web_server.overlay_manager.prewarm()
 
     debug = bool(args.debug)
 
@@ -917,10 +894,6 @@ def main():
     server_thread = threading.Thread(target=run_server, args=(app, listener_socket))
     server_thread.daemon = True
     server_thread.start()
-
-    # Pre-warm the overlay process by starting it hidden
-    if not getattr(sys, "frozen", False) or "--run-overlay" not in sys.argv:
-        web_server.overlay_manager.prewarm()
 
     if AUTO_OPEN_WEBVIEW:
         try:
