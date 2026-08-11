@@ -1762,7 +1762,7 @@ mod tests {
         );
         assert_eq!(
             fill_color_for_channel(CaptionChannel::PeerChannel),
-            (1.0, 215.0 / 255.0, 0.0, 1.0)
+            (1.0, 1.0, 1.0, 1.0)
         );
     }
 

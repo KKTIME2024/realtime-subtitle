@@ -27,7 +27,7 @@ pub(crate) const TEXT_OUTLINE_OVERHANG_PX: f32 = 5.0;
 pub(crate) const SELF_TEXT_FILL_COLOR: (f32, f32, f32, f32) = (1.0, 1.0, 1.0, 1.0);
 #[cfg_attr(not(windows), allow(dead_code))]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) const PEER_TEXT_FILL_COLOR: (f32, f32, f32, f32) = (1.0, 215.0 / 255.0, 0.0, 1.0);
+pub(crate) const PEER_TEXT_FILL_COLOR: (f32, f32, f32, f32) = (1.0, 1.0, 1.0, 1.0);
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const SECONDARY_PEER_TEXT_FILL_COLOR: (f32, f32, f32, f32) = (1.0, 1.0, 1.0, 0.80);
 #[cfg(windows)]
