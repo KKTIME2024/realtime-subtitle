@@ -428,8 +428,10 @@ impl OverlayRuntime {
         bridge: &mut BridgeClient,
         _logger: &OverlayLogger,
     ) -> Result<(), RuntimeFailure> {
+        let frame_start = Instant::now();
         let blocks = self.caption_blocks();
         let frame = renderer.render_blocks(blocks)?;
+        let render_ms = frame_start.elapsed().as_millis();
         let has_text = !frame.layout().visible_blocks.is_empty();
 
         let first = !self.ready_sent;
@@ -442,6 +444,12 @@ impl OverlayRuntime {
         }
 
         submitter.submit_frame(&frame)?;
+        eprintln!(
+            "[overlay][DIAG] frame render_ms={} submit_ms={} text={}",
+            render_ms,
+            frame_start.elapsed().as_millis(),
+            has_text
+        );
 
         if first {
             self.ready_sent = true;
