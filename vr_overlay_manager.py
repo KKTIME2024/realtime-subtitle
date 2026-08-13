@@ -84,6 +84,8 @@ class VROverlayManager:
             self.status = "crashed"
             return False
         self.status = "starting"
+        # exe 全量输出落盘 (诊断用; 宕机时最后一行即死因)。
+        self._log_file = open(self.work_dir / "overlay-logs" / "overlay.log", "ab")
         self._pump = threading.Thread(target=self._pump_stdout, daemon=True)
         self._pump.start()
         return True
@@ -95,6 +97,12 @@ class VROverlayManager:
                 proc.terminate()
             except Exception:
                 pass
+        log_file, self._log_file = getattr(self, "_log_file", None), None
+        if log_file is not None:
+            try:
+                log_file.close()
+            except Exception:
+                pass
         self.status = "stopped"
         self.should_fallback = False
         return False
@@ -103,6 +111,13 @@ class VROverlayManager:
         assert self._proc is not None and self._proc.stdout is not None
         try:
             for raw in self._proc.stdout:
+                log_file = getattr(self, "_log_file", None)
+                if log_file is not None:
+                    try:
+                        log_file.write(raw)
+                        log_file.flush()
+                    except Exception:
+                        pass
                 line = raw.decode("utf-8", "replace").rstrip()
                 if line.startswith("EVENT "):
                     self._on_event_line(line[len("EVENT "):])
