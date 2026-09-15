@@ -13,6 +13,22 @@ def fake_exe(tmp_path):
 
 
 class TestVROverlayManager:
+    def test_is_available_requires_exe_and_openvr_loader(self, tmp_path):
+        exe_path = fake_exe(tmp_path)
+        mgr = VROverlayManager(
+            bridge_url="ws://127.0.0.1:8080/vr_ws",
+            session_token="tok",
+            exe_path=exe_path,
+            work_dir=tmp_path,
+            parent_pid=1,
+        )
+
+        assert mgr.is_available() is False
+        exe_path.write_bytes(b"MZ")
+        assert mgr.is_available() is False
+        (tmp_path / "openvr_api.dll").write_bytes(b"MZ")
+        assert mgr.is_available() is True
+
     def test_manifest_written_with_contract(self, tmp_path):
         mgr = VROverlayManager(
             bridge_url="ws://127.0.0.1:8080/vr_ws",

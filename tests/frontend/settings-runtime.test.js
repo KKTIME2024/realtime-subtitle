@@ -15,6 +15,7 @@ function setup(overrides = {}) {
         <section id="microphone"><div id="microphonePicker"></div><p id="microphoneHint"></p></section>
         <section id="output"><div id="outputPicker"></div><p id="outputHint"></p></section>
         <div id="autoRestart"></div>
+        <label id="vrOverlayField"><div id="vrOverlayPicker"></div></label>
         <div id="sleepOnSilence"></div>
         <label id="speakerField"><div id="speakerPicker"></div></label>
         <label id="interruptField"><div id="interruptPicker"></div></label>
@@ -27,6 +28,8 @@ function setup(overrides = {}) {
         selectedProvider: 'soniox',
         providerSettings: {},
         autoRestartEnabled: true,
+        vrOverlayAvailable: true,
+        vrOverlayEnabled: false,
         sleepOnSilenceEnabled: true,
         interruptRepairEnabled: true,
         interruptRepairSupported: true,
@@ -89,6 +92,8 @@ function setup(overrides = {}) {
             outputDevicePickerHost: document.getElementById('outputPicker'),
             outputDeviceHint: document.getElementById('outputHint'),
             autoRestartPickerHost: document.getElementById('autoRestart'),
+            vrOverlaySettingField: document.getElementById('vrOverlayField'),
+            vrOverlayPickerHost: document.getElementById('vrOverlayPicker'),
             sleepOnSilencePickerHost: document.getElementById('sleepOnSilence'),
             speakerLabelsSettingField: document.getElementById('speakerField'),
             speakerLabelsPickerHost: document.getElementById('speakerPicker'),
@@ -142,6 +147,7 @@ describe('SettingsRuntime picker state', () => {
         const pickers = page.controller.getPickers();
 
         expect(pickers.autoRestart.value).toBe('true');
+        expect(pickers.vrOverlay.value).toBe('false');
         expect(pickers.sleepOnSilence.value).toBe('true');
         expect(pickers.speakerLabels.value).toBe('hide');
         expect(pickers.interruptRepair.value).toBe('true');
@@ -157,6 +163,7 @@ describe('SettingsRuntime picker state', () => {
         const page = setup({
             state: {
                 selectedProvider: 'gemini',
+                vrOverlayAvailable: false,
                 llmRefineAvailable: false,
                 segmentModeSupported: false,
                 interruptRepairSupported: false,
@@ -168,6 +175,8 @@ describe('SettingsRuntime picker state', () => {
 
         expect(page.document.getElementById('speakerField').hidden).toBe(true);
         expect(pickers.speakerLabels).toBeNull();
+        expect(page.document.getElementById('vrOverlayField').hidden).toBe(true);
+        expect(pickers.vrOverlay).toBeNull();
         expect(page.document.getElementById('interruptField').hidden).toBe(true);
         expect(pickers.interruptRepair).toBeNull();
         expect(page.document.getElementById('translationSection').hidden).toBe(true);

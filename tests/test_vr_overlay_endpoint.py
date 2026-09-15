@@ -49,6 +49,7 @@ class TestVrOverlayEndpoint:
             resp = await client.get("/vr-overlay")
             assert resp.status == 200
             data = await resp.json()
+            assert data["available"] is False
             assert data["enabled"] is False
             assert data["status"] == "stopped"
         finally:
@@ -69,6 +70,25 @@ class TestVrOverlayEndpoint:
             data = await resp.json()
             assert data["enabled"] is True
             mgr.start.assert_called_once()
+        finally:
+            await client.close()
+
+    @async_test
+    async def test_post_enable_rejects_unavailable_overlay(self):
+        ws_module, ws = make_web_server()
+        mgr = MagicMock()
+        mgr.is_available.return_value = False
+        mgr.status = "stopped"
+        ws.vr_overlay_manager = mgr
+        server = TestServer(ws.create_app())
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            resp = await client.post("/vr-overlay", json={"enabled": True})
+            assert resp.status == 409
+            data = await resp.json()
+            assert data["message"] == "VR overlay unavailable"
+            mgr.start.assert_not_called()
         finally:
             await client.close()
 

@@ -365,6 +365,15 @@
         }
 
         function renderVrOverlayPicker() {
+            const available = state().vrOverlayAvailable === true;
+            if (elements.vrOverlaySettingField) {
+                elements.vrOverlaySettingField.hidden = !available;
+            }
+            if (!available) {
+                if (elements.vrOverlayPickerHost) elements.vrOverlayPickerHost.innerHTML = '';
+                pickers.vrOverlay = null;
+                return null;
+            }
             const enabled = state().vrOverlayEnabled === true;
             setDraft({ vrOverlayEnabled: enabled });
             return replaceHost(elements.vrOverlayPickerHost, 'vrOverlay', [

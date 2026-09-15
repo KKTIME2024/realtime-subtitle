@@ -429,6 +429,10 @@ class TestWebServerSecurity:
             session.get_translation_target_lang.return_value = "en"
             session.get_llm_refine_mode.return_value = "off"
             ws = WebServer(session, self.mock_logger())
+            vr_overlay_manager = MagicMock()
+            vr_overlay_manager.is_available.return_value = True
+            vr_overlay_manager.status = "stopped"
+            ws.vr_overlay_manager = vr_overlay_manager
             ws._server_request = AsyncMock(return_value=(200, {
                 "client_latest_version": "1.4.0",
                 "client_minimum_version": "1.1.0",
@@ -445,6 +449,7 @@ class TestWebServerSecurity:
             assert response_data["client_minimum_version"] == "1.1.0"
             assert response_data["client_update_url"] == "https://subtitle.example/download"
             assert response_data["client_update_notes"] == "Bug fixes"
+            assert response_data["vr_overlay_available"] is True
 
     @async_test
     async def test_set_audio_source_invalid(self):

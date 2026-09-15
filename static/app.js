@@ -111,6 +111,7 @@ const outputDeviceHint = document.getElementById('outputDeviceHint');
 const bundledCjkFontPickerHost = document.getElementById('bundledCjkFontPicker');
 const runtimeControlsSection = document.getElementById('runtimeControlsSection');
 const autoRestartPickerHost = document.getElementById('autoRestartPicker');
+const vrOverlaySettingField = document.getElementById('vrOverlaySettingField');
 const vrOverlayPickerHost = document.getElementById('vrOverlayPicker');
 const sleepOnSilencePickerHost = document.getElementById('sleepOnSilencePicker');
 const speakerLabelsSettingField = document.getElementById('speakerLabelsSettingField');
@@ -233,6 +234,7 @@ const settingsRuntime = SettingsRuntime.create({
         outputDevicePickerHost,
         outputDeviceHint,
         autoRestartPickerHost,
+        vrOverlaySettingField,
         vrOverlayPickerHost,
         sleepOnSilencePickerHost,
         speakerLabelsSettingField,
@@ -252,6 +254,7 @@ const settingsRuntime = SettingsRuntime.create({
         get selectedProvider() { return settingsPorts.getSelectedProvider(); },
         get providerSettings() { return settingsPorts.loadProviderSettings(); },
         get autoRestartEnabled() { return autoRestartEnabled; },
+        get vrOverlayAvailable() { return vrOverlayAvailable; },
         get vrOverlayEnabled() { return vrOverlayEnabled; },
         get sleepOnSilenceEnabled() { return sleepOnSilenceEnabled; },
         get interruptRepairEnabled() { return interruptRepairEnabled; },
@@ -277,6 +280,9 @@ const settingsRuntime = SettingsRuntime.create({
         }
         if (Object.prototype.hasOwnProperty.call(patch, 'vrOverlayEnabled')) {
             vrOverlayEnabled = patch.vrOverlayEnabled;
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, 'vrOverlayAvailable')) {
+            vrOverlayAvailable = patch.vrOverlayAvailable;
         }
         if (Object.prototype.hasOwnProperty.call(patch, 'interruptRepairEnabled')) {
             interruptRepairEnabled = patch.interruptRepairEnabled;
@@ -473,6 +479,7 @@ let displayMode = settingsStore.loadDisplayMode();
 
 // 自动重启识别开关（默认开启；已有保存值优先）
 let autoRestartEnabled = settingsStore.loadAutoRestartEnabled();
+let vrOverlayAvailable = false;
 let vrOverlayEnabled = settingsStore.loadVrOverlayEnabled();
 let sleepOnSilenceEnabled = settingsStore.loadSleepOnSilenceEnabled();
 let interruptRepairEnabled = settingsStore.loadInterruptRepairEnabled();
@@ -530,6 +537,11 @@ async function setVrOverlayEnabled(enabled) {
 }
 
 function applyVrOverlayConfig(data = {}) {
+    vrOverlayAvailable = data.vr_overlay_available === true;
+    if (!vrOverlayAvailable) {
+        vrOverlayEnabled = false;
+        return;
+    }
     if (typeof data.vr_overlay_enabled !== 'boolean') return;
     const stored = settingsStore.readVrOverlayEnabled();
     vrOverlayEnabled = stored === null ? data.vr_overlay_enabled : stored;

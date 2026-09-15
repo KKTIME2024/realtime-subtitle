@@ -60,11 +60,21 @@ class VROverlayManager:
     def is_open(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def is_available(self) -> bool:
+        """Whether this installation has everything needed to launch the overlay.
+
+        ``openvr_sys`` only supplies Rust bindings; the Valve loader is a separate
+        DLL which must sit next to the overlay executable in both source and
+        PyInstaller runs.  Checking both files keeps the UI from offering a
+        control that is guaranteed to fail locally.
+        """
+        return self.exe_path.is_file() and self.exe_path.with_name("openvr_api.dll").is_file()
+
     def start(self) -> bool:
         if self.is_open():
             return True
-        if not self.exe_path.exists():
-            print(f"⚠️  VR overlay exe not found: {self.exe_path}")
+        if not self.is_available():
+            print(f"⚠️  VR overlay is unavailable: missing {self.exe_path} or its openvr_api.dll loader")
             self.status = "crashed"
             return False
         manifest = self.write_manifest()

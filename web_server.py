@@ -387,6 +387,12 @@ class WebServer:
             ),
             "interrupt_repair_enabled": bool(config.SONIOX_INTERRUPT_REPAIR_ENABLED),
             "sleep_on_silence_enabled": config.get_sleep_on_silence_enabled(provider),
+            # Only advertise the control when the local Rust executable and its
+            # OpenVR loader were actually bundled/built.
+            "vr_overlay_available": bool(
+                getattr(self, "vr_overlay_manager", None) is not None
+                and self.vr_overlay_manager.is_available()
+            ),
             # VR 浮层真实状态 (开关初始值以此为准, 防 localStorage 与后端脱节)。
             "vr_overlay_enabled": (
                 getattr(self, "vr_overlay_manager", None) is not None
@@ -1295,6 +1301,7 @@ class WebServer:
         """VR overlay 开关状态查询。"""
         manager = getattr(self, "vr_overlay_manager", None)
         return web.json_response({
+            "available": manager is not None and manager.is_available(),
             "enabled": manager is not None and manager.status not in ("stopped", "crashed"),
             "status": manager.status if manager is not None else "stopped",
         })
@@ -1315,6 +1322,8 @@ class WebServer:
         if manager is None:
             return web.json_response({"status": "error", "message": "VR overlay not wired"}, status=400)
         if payload.get("enabled"):
+            if not manager.is_available():
+                return web.json_response({"status": "error", "message": "VR overlay unavailable"}, status=409)
             start = getattr(self, "vr_overlay_start", None)
             if start is not None:
                 start()
