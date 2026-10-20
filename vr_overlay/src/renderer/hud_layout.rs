@@ -18,7 +18,7 @@ use crate::hud::{HudFrame, HudRowRole, HUD_SLOT_COUNT};
 
 use super::font_resolver::{FontResolver, TextStyleKey};
 use super::layout::{measure_text_width, style_descriptor_for_text};
-use super::text_fit::{fit_row_text_with_measure, Truncation};
+use super::text_fit::PagedRowText;
 use super::types::{
     BlockBounds, CaptionBlockVariant, CaptionRenderError, LayoutCacheKey, LineRole,
     ResolvedBlockLayout, ResolvedFrameLayout, ResolvedLineLayout, TextStyleDescriptor,
@@ -64,6 +64,16 @@ struct MeasuredHudLine {
 #[derive(Debug, Default)]
 pub struct HudLayoutCache {
     entries: HashMap<HudGeometryKey, MeasuredHudLine>,
+    pages: Vec<PagedHudLine>,
+}
+
+#[derive(Debug, Clone)]
+struct PagedHudLine {
+    role: HudRowRole,
+    language: Option<String>,
+    font_size_px: f32,
+    content_width_px: f32,
+    text: PagedRowText,
 }
 
 impl HudLayoutCache {
@@ -143,6 +153,7 @@ pub(crate) fn build_hud_layout_with_measurer(
     let mut hasher = DefaultHasher::new();
     let mut occupied = 0usize;
     let mut reused = 0usize;
+    let mut pages = Vec::with_capacity(HUD_SLOT_COUNT);
 
     for (slot, row) in frame.slots.iter().enumerate() {
         let Some(row) = row else {
@@ -155,26 +166,32 @@ pub(crate) fn build_hud_layout_with_measurer(
             HudRowRole::UpperSecondary | HudRowRole::LiveSource => SECONDARY_FONT_SCALE,
         };
         let font_size_px = DEFAULT_FONT_SIZE_PX * text_scale * role_scale;
-        let raw_measurement = measurer.measure(
-            row.language.as_deref(),
-            &raw_display_text,
-            font_size_px,
-            content_width_px,
-        )?;
-        let truncation = if row.role == HudRowRole::LiveSource {
-            Truncation::Leading
-        } else {
-            Truncation::Trailing
-        };
-        let needs_truncation = raw_measurement.width_px > content_width_px;
-        let display_text = if !needs_truncation {
-            raw_display_text.clone()
-        } else {
-            let measurement_error = RefCell::new(None);
-            let fitted = fit_row_text_with_measure(
+        // Search all previous rows: speaker recency may move an unchanged
+        // segment to another slot. Pagination is text/layout state, not slot
+        // state or sentence identity (a segment spans multiple sentence ids).
+        let mut page = cache
+            .pages
+            .iter()
+            .find(|page| {
+                page.role == row.role
+                    && page.language == row.language
+                    && page.font_size_px == font_size_px
+                    && page.content_width_px == content_width_px
+                    && page.text.can_continue(&raw_display_text, content_width_px)
+            })
+            .cloned()
+            .unwrap_or_else(|| PagedHudLine {
+                role: row.role,
+                language: row.language.clone(),
+                font_size_px,
+                content_width_px,
+                text: PagedRowText::default(),
+            });
+        let measurement_error = RefCell::new(None);
+        let display_text =
+            page.text.fit(
                 &raw_display_text,
                 content_width_px,
-                truncation,
                 &|candidate| match measurer.measure(
                     row.language.as_deref(),
                     candidate,
@@ -188,21 +205,16 @@ pub(crate) fn build_hud_layout_with_measurer(
                     }
                 },
             );
-            if let Some(error) = measurement_error.into_inner() {
-                return Err(error);
-            }
-            fitted
-        };
-        let measured = if !needs_truncation {
-            raw_measurement
-        } else {
-            measurer.measure(
-                row.language.as_deref(),
-                &display_text,
-                font_size_px,
-                content_width_px,
-            )?
-        };
+        if let Some(error) = measurement_error.into_inner() {
+            return Err(error);
+        }
+        let measured = measurer.measure(
+            row.language.as_deref(),
+            &display_text,
+            font_size_px,
+            content_width_px,
+        )?;
+        pages.push(page);
         let key = HudGeometryKey {
             slot,
             display_text: display_text.clone(),
@@ -295,6 +307,9 @@ pub(crate) fn build_hud_layout_with_measurer(
         blocks.push(block);
     }
 
+    // Keep at most the five current rows, and only commit pagination after all
+    // measurements succeed. Clear/hidden rows cannot retain stale page state.
+    cache.pages = pages;
     Ok(BuiltHudLayout {
         layout: ResolvedFrameLayout {
             visible_blocks: blocks,
@@ -586,5 +601,105 @@ mod tests {
             assert_eq!(a.primary_lines[0].origin_y, b.primary_lines[0].origin_y);
             assert!((b.primary_lines[0].width_px - a.primary_lines[0].width_px).abs() > 0.0);
         }
+    }
+
+    fn small_build(frame: &HudFrame, width: u32, cache: &mut HudLayoutCache) -> BuiltHudLayout {
+        build_hud_layout(
+            frame,
+            1.0,
+            width,
+            &FontResolver::default(),
+            cache,
+            &|text, _, _| text.chars().count() as f32,
+        )
+    }
+
+    #[test]
+    fn long_rows_page_inside_their_own_slots_and_keep_the_complete_frame() {
+        let text = "甲乙丙丁戊己庚辛壬癸子";
+        let input = frame(&[
+            (0, row(HudRowRole::UpperPrimary, HudRowKind::Settled, text)),
+            (
+                1,
+                row(HudRowRole::UpperSecondary, HudRowKind::Settled, text),
+            ),
+            (2, row(HudRowRole::UpperPrimary, HudRowKind::Draft, text)),
+            (
+                3,
+                row(HudRowRole::UpperSecondary, HudRowKind::Settled, text),
+            ),
+            (4, row(HudRowRole::LiveSource, HudRowKind::Draft, text)),
+        ]);
+        let original = input.clone();
+        let built = small_build(&input, 104, &mut HudLayoutCache::new());
+        assert_eq!(built.layout.visible_blocks.len(), HUD_SLOT_COUNT);
+        for (slot, block) in built.layout.visible_blocks.iter().enumerate() {
+            assert_eq!(block.primary_lines.len(), 1);
+            assert!(block.secondary_line.is_none());
+            let line = &block.primary_lines[0];
+            assert_eq!(line.text, "庚辛壬癸子");
+            assert_eq!(line.origin_x, HUD_TEXT_LEFT_PX);
+            assert_eq!(line.origin_y, hud_slot_top_px(slot));
+            assert!(line.width_px <= 8.0);
+        }
+        assert_eq!(input, original, "fitting must not mutate projected content");
+    }
+
+    #[test]
+    fn page_survives_recency_moves_and_kind_changes_without_extra_rows() {
+        let mut cache = HudLayoutCache::new();
+        let first = frame(&[(
+            3,
+            row(
+                HudRowRole::UpperPrimary,
+                HudRowKind::Draft,
+                "甲乙丙丁戊己庚辛壬",
+            ),
+        )]);
+        small_build(&first, 104, &mut cache);
+        let moved = frame(&[(
+            1,
+            row(
+                HudRowRole::UpperPrimary,
+                HudRowKind::Settled,
+                "甲乙丙丁戊己庚辛壬癸",
+            ),
+        )]);
+        let built = small_build(&moved, 104, &mut cache);
+        assert_eq!(
+            built.layout.visible_blocks[0].primary_lines[0].text,
+            "庚辛壬癸"
+        );
+        assert_eq!(
+            built.layout.visible_blocks[0].primary_lines[0].origin_y,
+            hud_slot_top_px(1)
+        );
+        let again = small_build(&moved, 104, &mut cache);
+        assert!(again.geometry_reused);
+        assert_eq!(again.visual_signature, built.visual_signature);
+        let mut draft = moved.clone();
+        draft.slots[1].as_mut().unwrap().kind = HudRowKind::Draft;
+        let changed = small_build(&draft, 104, &mut cache);
+        assert!(changed.geometry_reused);
+        assert_ne!(changed.visual_signature, built.visual_signature);
+    }
+
+    #[test]
+    fn revised_resized_and_cleared_rows_never_inherit_stale_page_offsets() {
+        let mut cache = HudLayoutCache::new();
+        for (width, text) in [
+            (104, "甲乙丙丁戊己庚辛壬癸子丑"),
+            (104, "修正后的新句子，与之前不同"),
+            (108, "修正后的新句子，与之前不同"),
+            (104, "短句"),
+        ] {
+            let input = frame(&[(4, row(HudRowRole::LiveSource, HudRowKind::Draft, text))]);
+            let built = small_build(&input, width, &mut cache);
+            let fresh = small_build(&input, width, &mut HudLayoutCache::new());
+            assert_eq!(built.geometry_keys, fresh.geometry_keys);
+            assert_eq!(cache.pages.len(), 1);
+        }
+        small_build(&HudFrame::default(), 104, &mut cache);
+        assert!(cache.pages.is_empty());
     }
 }

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VR 长句 · 行内显示对比</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.6 system-ui, sans-serif; background: #10171d; color: #e7edef; }
+  body { max-width: 1320px; margin: auto; padding: 32px 24px; }
+  h1 { font-size: 26px; margin-bottom: 4px; }
+  p { color: #abbac4; margin-top: 0; }
+  .controls { display: flex; gap: 16px; flex-wrap: wrap; align-items: end; margin: 24px 0; }
+  label { display: grid; gap: 5px; font-size: 13px; color: #abbac4; }
+  button, select { font: inherit; color: #e7edef; border: 1px solid #41535e; border-radius: 6px; background: #1a2832; padding: 8px 12px; }
+  button { cursor: pointer; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid #81e3cd; outline-offset: 3px; }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  article { padding: 18px; background: #17232b; border: 1px solid #31444f; border-radius: 10px; min-width: 0; }
+  h2 { font-size: 18px; margin: 0; }
+  .stats { color: #abbac4; font-size: 13px; margin-bottom: 12px; min-height: 24px; }
+  .hud { background: #080f14; padding: 12px; border-radius: 6px; }
+  .row { display: flex; align-items: center; height: 52px; border-bottom: 1px solid #25313a; }
+  .row:last-child { border-bottom: 0; }
+  .slot { width: 36px; flex-shrink: 0; font: 11px monospace; color: #526673; }
+  .caption { white-space: pre; font: 16px/1.5 ui-monospace, Consolas, "Microsoft YaHei", monospace; }
+  #old .caption { color: #f2c390; }
+  #new .caption { color: #81e3cd; }
+  .timeline { display: flex; align-items: center; gap: 14px; margin: 24px 0 16px; }
+  input[type=range] { flex: 1; accent-color: #81e3cd; }
+  output { min-width: 85px; font-variant-numeric: tabular-nums; }
+  .source { background: #17232b; padding: 16px; border-radius: 8px; min-height: 80px; }
+  .note { font-size: 13px; margin-top: 16px; }
+  @media (max-width: 850px) { .panels { grid-template-columns: 1fr; } body { padding: 18px 12px; } }
+</style>
+<h1>长句留在原来的行里</h1>
+<p>拖动进度或逐字播放，观察同一行的起点何时改变。其余槽位留空，只比较行内处理。</p>
+<div class="controls">
+  <label>回放文本<select id="sample"><option>中文长句</option><option>暂时没有标点的原文</option><option>English</option></select></label>
+  <label>示意行宽<select id="budget"><option value="36">约 18 个汉字</option><option value="48" selected>约 24 个汉字</option><option value="64">约 32 个汉字</option></select></label>
+  <label>观察槽位<select id="slot"><option value="4">4 · 实时原文</option><option value="2">2 · 双语译文</option><option value="3">3 · 双语原文 / 单语行</option></select></label>
+  <label>播放速度<select id="speed"><option value="400">慢</option><option value="200" selected>中</option><option value="100">快</option></select></label>
+  <button id="play" type="button">播放</button><button id="restart" type="button">回到开头</button>
+</div>
+<div class="panels">
+  <article id="old"><h2>原先：逐次截取尾部</h2><div class="stats"></div><div class="hud"></div></article>
+  <article id="new"><h2>现在：满行后整段切换</h2><div class="stats"></div><div class="hud"></div></article>
+</div>
+<div class="timeline"><label for="position">进度</label><input id="position" type="range" min="0" value="0" aria-label="回放进度"><output id="counter"></output></div>
+<div class="source" id="source"></div>
+<p class="note">内容由同一份 Rust 显示算法生成。此页使用示意字宽，不模拟头显视角或 DirectWrite 字体；行首变化次数仅说明布局行为，不代表阅读舒适度。一次到达的完整长句直接显示最后一段，没有自动补播前文。</p>
+<script>
+const cases = __REPLAY_DATA__;
+const byId = id => document.getElementById(id);
+let timer = null;
+for (const mode of ['old', 'new']) {
+  const hud = byId(mode).querySelector('.hud');
+  for (let i = 0; i < 5; i++) {
+    const row = document.createElement('div'); row.className = 'row';
+    const label = document.createElement('span'); label.className = 'slot'; label.textContent = i;
+    const text = document.createElement('span'); text.className = 'caption';
+    row.append(label, text); hud.append(row);
+  }
+}
+function currentCase() { return cases.find(item => item.name === byId('sample').value && item.budget === Number(byId('budget').value)); }
+function draw() {
+  const item = currentCase();
+  byId('position').max = item.frames.length - 1;
+  const index = Math.min(Number(byId('position').value), item.frames.length - 1);
+  const frame = item.frames[index];
+  for (const mode of ['old', 'new']) {
+    const captions = byId(mode).querySelectorAll('.caption');
+    captions.forEach((caption, i) => { caption.textContent = i === Number(byId('slot').value) ? frame[mode] : ''; });
+    // Resize only this schematic preview to fit the browser. The actual HUD
+    // never shrinks text; both algorithms here always use the chosen budget.
+    const available = byId(mode).querySelector('.row').clientWidth - 36;
+    const size = Math.min(18, available / item.budget / 0.64);
+    captions.forEach(caption => { caption.style.fontSize = size + 'px'; });
+    byId(mode).querySelector('.stats').textContent = `行首已改变 ${frame[mode + 'Moves']} 次` + (frame[mode + 'Turn'] ? ' · 本步发生切换' : '');
+  }
+  byId('source').textContent = frame.source;
+  byId('counter').textContent = `${index + 1} / ${item.frames.length}`;
+}
+function pause() { clearInterval(timer); timer = null; byId('play').textContent = '播放'; }
+function play() {
+  if (Number(byId('position').value) >= currentCase().frames.length - 1) byId('position').value = 0;
+  byId('play').textContent = '暂停';
+  timer = setInterval(() => {
+    byId('position').value = Number(byId('position').value) + 1; draw();
+    if (Number(byId('position').value) >= currentCase().frames.length - 1) pause();
+  }, Number(byId('speed').value));
+}
+byId('play').onclick = () => timer === null ? play() : pause();
+byId('restart').onclick = () => { pause(); byId('position').value = 0; draw(); };
+byId('position').oninput = () => { pause(); draw(); };
+for (const name of ['sample', 'budget']) byId(name).onchange = () => { pause(); byId('position').value = 0; draw(); };
+byId('slot').onchange = draw;
+byId('speed').onchange = () => { if (timer !== null) { pause(); play(); } };
+window.addEventListener('resize', draw);
+byId('position').max = currentCase().frames.length - 1;
+const requestedFrame = Number(new URLSearchParams(location.search).get('frame'));
+if (Number.isFinite(requestedFrame)) byId('position').value = Math.max(0, requestedFrame);
+draw();
+</script>
+</html>

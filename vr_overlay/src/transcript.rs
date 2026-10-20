@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Instant;
 
 use crate::views::VrViewSettings;
 
 const LEDGER_CAP: usize = 64;
 const PENDING_REFINEMENT_CAP: usize = 64;
+const SPEC_CACHE_CAP: usize = 80;
 
 /// A session-scoped Soniox diarization value. It is intentionally not a
 /// durable human identity.
@@ -69,11 +70,38 @@ pub struct TargetUpdate {
 }
 
 /// A refinement carries no speaker; it is keyed strictly by `sentence_id`.
+/// `source` is the refine frame's source text, used to retire the matching
+/// speculative-translation marker (the desktop clears its pending map by
+/// source text on every refine result).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refinement {
     pub sentence_id: String,
     pub text: String,
     pub language: Option<String>,
+    pub source: Option<String>,
+}
+
+/// A typed display separator from the backend. It marks a display line break
+/// and never changes sentence identity: source sentence IDs already delimit
+/// sentences, and late translations for a closed sentence keep the old ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeparatorKind {
+    Punctuation,
+    Translation,
+    Endpoint,
+    SpeakerChange,
+    InterruptRepair,
+    Reconnect,
+    Unknown,
+}
+
+/// A speculative translation is keyed by the exact source text the backend
+/// fired it for (the backend carries no sentence id on these frames).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecTranslation {
+    pub source: String,
+    pub translation: String,
+    pub target_lang: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -98,6 +126,33 @@ pub enum CaptionEvent {
     TargetDraft(TargetUpdate),
     TargetCommitted(TargetUpdate),
     RefinedTarget(Refinement),
+    /// A `refine_result` with `no_change: true`: the sentence's current
+    /// translation is confirmed final. The desktop records a per-sentence
+    /// confirmation; here a draft target is promoted to committed.
+    TargetConfirmed {
+        sentence_id: String,
+        source: Option<String>,
+    },
+    /// The backend retracted a sentence (interrupt repair). All tokens with
+    /// the retracted id are removed; the replacement sentence is re-emitted
+    /// by the backend as fresh final tokens under `replacement_sentence_id`.
+    Retract {
+        sentence_id: String,
+        replacement_sentence_id: Option<String>,
+        reason: Option<String>,
+    },
+    /// A typed display separator. It finalizes the live row's open draft and
+    /// settles the live row; it never resets id-keyed accumulators.
+    Separator {
+        kind: SeparatorKind,
+    },
+    /// Speculative translation in flight for the exact source text.
+    SpecPending {
+        source: String,
+        target_lang: Option<String>,
+    },
+    /// Speculative translation result for the exact source text.
+    SpecTranslation(SpecTranslation),
     Clear {
         preserve_existing: bool,
     },
@@ -113,9 +168,29 @@ pub struct TranscriptState {
     speaker_recency: VecDeque<SpeakerKey>,
     next_local_ordinal: u64,
     pending_refinements: VecDeque<Refinement>,
+    /// Retracted sentence ids. Late refinements for a retracted sentence are
+    /// dropped (the desktop ignores them via its retracted-id set).
+    retracted_ids: BTreeSet<String>,
+    /// Normalized source text -> pending target language.
+    spec_pending: VecDeque<(String, Option<String>)>,
+    /// Completed speculative results remain reusable by repeated exact source.
+    spec_translations: VecDeque<SpecTranslation>,
 }
 
 impl TranscriptState {
+    pub fn spec_pending_for(&self, source: &str) -> Option<Option<String>> {
+        let source = normalize_source(source);
+        self.spec_pending
+            .iter()
+            .rev()
+            .find(|(known, _)| known == source)
+            .map(|(_, language)| language.clone())
+    }
+
+    pub fn is_retracted(&self, sentence_id: &str) -> bool {
+        self.retracted_ids.contains(sentence_id)
+    }
+
     pub fn apply(&mut self, event: &CaptionEvent, now: Instant) {
         match event {
             CaptionEvent::SourceLive(snapshot) => self.apply_source_live(snapshot, now),
@@ -129,6 +204,17 @@ impl TranscriptState {
                 self.apply_target(update, TrackPhase::Committed)
             }
             CaptionEvent::RefinedTarget(refinement) => self.apply_refinement(refinement),
+            CaptionEvent::TargetConfirmed {
+                sentence_id,
+                source,
+            } => self.apply_target_confirmed(sentence_id, source.as_deref()),
+            CaptionEvent::Retract { sentence_id, .. } => self.apply_retract(sentence_id),
+            CaptionEvent::Separator { kind } => self.apply_separator(*kind),
+            CaptionEvent::SpecPending {
+                source,
+                target_lang,
+            } => self.apply_spec_pending(source, target_lang.as_deref()),
+            CaptionEvent::SpecTranslation(spec) => self.apply_spec_translation(spec),
             CaptionEvent::Clear { preserve_existing } => {
                 self.clear(*preserve_existing);
                 return;
@@ -138,27 +224,26 @@ impl TranscriptState {
             | CaptionEvent::Shutdown => return,
         }
         self.replay_pending_refinements();
+        self.replay_cached_specs();
     }
 
     pub fn clear(&mut self, preserve_existing: bool) {
         if preserve_existing {
+            // The desktop finalizes the current non-final tokens before a
+            // rollover restart: draft content is preserved as committed text
+            // instead of being dropped. Sentence ids survive a stream
+            // rollover, so in-progress sentences may keep receiving tokens.
             let mut kept = VecDeque::new();
             for mut record in std::mem::take(&mut self.sentences) {
-                let source_kept = matches!(
-                    record.source.phase,
-                    TrackPhase::Committed | TrackPhase::Refined
-                );
-                let target_kept = matches!(
-                    record.target.phase,
-                    TrackPhase::Committed | TrackPhase::Refined
-                );
-                if !source_kept {
-                    record.source = TextTrack::default();
+                if record.source.phase == TrackPhase::Draft {
+                    record.source.phase = TrackPhase::Committed;
                 }
-                if !target_kept {
-                    record.target = TextTrack::default();
+                if record.target.phase == TrackPhase::Draft {
+                    record.target.phase = TrackPhase::Committed;
                 }
-                if source_kept || target_kept {
+                if record.source.phase != TrackPhase::Empty
+                    || record.target.phase != TrackPhase::Empty
+                {
                     kept.push_back(record);
                 }
             }
@@ -166,6 +251,9 @@ impl TranscriptState {
         } else {
             self.sentences.clear();
             self.next_local_ordinal = 0;
+            self.retracted_ids.clear();
+            self.spec_pending.clear();
+            self.spec_translations.clear();
         }
         self.live_input = LiveInputRow::Hidden;
         if preserve_existing {
@@ -224,6 +312,13 @@ impl TranscriptState {
         if snapshot.text.is_empty() {
             return;
         }
+        if snapshot
+            .sentence_id
+            .as_deref()
+            .is_some_and(|id| self.retracted_ids.contains(id))
+        {
+            return;
+        }
         let index = match self.open_record_index(&snapshot.speaker) {
             Some(index) => index,
             None => self.push_record(snapshot.speaker.clone(), None),
@@ -238,6 +333,13 @@ impl TranscriptState {
     }
 
     fn apply_source_committed(&mut self, committed: &CommittedSource, now: Instant) {
+        if committed
+            .sentence_id
+            .as_deref()
+            .is_some_and(|id| self.retracted_ids.contains(id))
+        {
+            return;
+        }
         let index = self.resolve_or_create(&committed.speaker, committed.sentence_id.as_deref());
         self.sentences[index].source = TextTrack {
             text: committed.text.clone(),
@@ -266,6 +368,9 @@ impl TranscriptState {
     }
 
     fn apply_source_end(&mut self, speaker: &SpeakerKey, sentence_id: Option<&str>, now: Instant) {
+        if sentence_id.is_some_and(|id| self.retracted_ids.contains(id)) {
+            return;
+        }
         let index = match sentence_id {
             Some(id) => self
                 .find_by_upstream_for_speaker(id, speaker)
@@ -316,9 +421,23 @@ impl TranscriptState {
     }
 
     fn apply_target(&mut self, update: &TargetUpdate, phase: TrackPhase) {
+        if update
+            .sentence_id
+            .as_deref()
+            .is_some_and(|id| self.retracted_ids.contains(id))
+        {
+            return;
+        }
         let index = match update.sentence_id.as_deref() {
             Some(id) => Some(self.resolve_or_create(&update.speaker, Some(id))),
-            None => self.open_record_index(&update.speaker),
+            // Non-final translation tokens carry no sentence id. The desktop
+            // binds them to the speaker's most recent sentence that has
+            // original text, even when that sentence is already closed; a
+            // translation with no original at all becomes its own sentence.
+            None => match self.latest_source_record_index(&update.speaker) {
+                Some(index) => Some(index),
+                None => Some(self.push_record(update.speaker.clone(), None)),
+            },
         };
         if let Some(index) = index {
             let current_phase = self.sentences[index].target.phase;
@@ -341,6 +460,10 @@ impl TranscriptState {
     }
 
     fn apply_refinement(&mut self, refinement: &Refinement) {
+        if self.retracted_ids.contains(&refinement.sentence_id) {
+            return;
+        }
+        self.retire_spec_pending_for_source(refinement.source.as_deref());
         if let Some(index) = self.find_by_upstream(&refinement.sentence_id) {
             self.sentences[index].target = TextTrack {
                 text: refinement.text.clone(),
@@ -353,6 +476,145 @@ impl TranscriptState {
                 self.pending_refinements.pop_front();
             }
         }
+    }
+
+    fn apply_target_confirmed(&mut self, sentence_id: &str, source: Option<&str>) {
+        if self.retracted_ids.contains(sentence_id) {
+            return;
+        }
+        self.retire_spec_pending_for_source(source);
+        if let Some(index) = self.find_by_upstream(sentence_id) {
+            // The confirmed translation is the text already on the track; a
+            // draft target becomes settled, matching the desktop's confirmed
+            // sentence state (no replacement text is invented).
+            if self.sentences[index].target.phase == TrackPhase::Draft {
+                self.sentences[index].target.phase = TrackPhase::Committed;
+            }
+        }
+    }
+
+    fn apply_retract(&mut self, sentence_id: &str) {
+        self.retracted_ids.insert(sentence_id.to_owned());
+        self.pending_refinements
+            .retain(|pending| pending.sentence_id != sentence_id);
+        self.sentences
+            .retain(|record| record.key.upstream_id.as_deref() != Some(sentence_id));
+        let retracts_live = match &self.live_input {
+            LiveInputRow::Streaming(snapshot) | LiveInputRow::Settled { snapshot, .. } => {
+                snapshot.sentence_id.as_deref() == Some(sentence_id)
+            }
+            LiveInputRow::Hidden => false,
+        };
+        if retracts_live {
+            self.live_input = LiveInputRow::Hidden;
+        }
+    }
+
+    fn apply_separator(&mut self, _kind: SeparatorKind) {
+        // The separator is a display line break. In the id-keyed model it has
+        // exactly one transcript effect: the utterance behind the live row
+        // has reached its boundary, so finalize any still-open draft for that
+        // speaker and settle the live row.
+        if let LiveInputRow::Streaming(snapshot) = &self.live_input {
+            if let Some(index) = self.unbound_open_index(&snapshot.speaker) {
+                if self.sentences[index].source.phase == TrackPhase::Draft {
+                    self.sentences[index].source.phase = TrackPhase::Committed;
+                }
+            }
+            self.live_input = LiveInputRow::Settled {
+                snapshot: snapshot.clone(),
+                closed_at: std::time::Instant::now(),
+            };
+        }
+    }
+
+    fn apply_spec_pending(&mut self, source: &str, target_lang: Option<&str>) {
+        let source = normalize_source(source);
+        if source.is_empty() {
+            return;
+        }
+        self.spec_pending.retain(|(known, _)| known != source);
+        self.spec_pending
+            .push_back((source.to_owned(), target_lang.map(str::to_owned)));
+        while self.spec_pending.len() > SPEC_CACHE_CAP {
+            self.spec_pending.pop_front();
+        }
+        if let Some(index) = self.find_record_by_source_text(source) {
+            let track = &mut self.sentences[index].target;
+            if track.text.is_empty() {
+                track.phase = TrackPhase::Draft;
+                track.language = target_lang.map(str::to_owned);
+            }
+        }
+    }
+
+    fn apply_spec_translation(&mut self, spec: &SpecTranslation) {
+        let source = normalize_source(&spec.source);
+        let translation = spec.translation.trim();
+        if source.is_empty() || translation.is_empty() {
+            return;
+        }
+        self.spec_pending.retain(|(known, _)| known != source);
+        self.spec_translations
+            .retain(|known| normalize_source(&known.source) != source);
+        self.spec_translations.push_back(SpecTranslation {
+            source: source.to_owned(),
+            translation: translation.to_owned(),
+            target_lang: spec.target_lang.clone(),
+        });
+        while self.spec_translations.len() > SPEC_CACHE_CAP {
+            self.spec_translations.pop_front();
+        }
+        self.replay_cached_specs();
+    }
+
+    fn replay_cached_specs(&mut self) {
+        for record in &mut self.sentences {
+            let source = normalize_source(&record.source.text);
+            let Some(spec) = self
+                .spec_translations
+                .iter()
+                .rev()
+                .find(|spec| normalize_source(&spec.source) == source)
+            else {
+                continue;
+            };
+            if matches!(record.target.phase, TrackPhase::Empty | TrackPhase::Draft) {
+                record.target = TextTrack {
+                    text: spec.translation.clone(),
+                    phase: TrackPhase::Draft,
+                    language: spec.target_lang.clone(),
+                };
+            }
+        }
+    }
+
+    fn retire_spec_pending_for_source(&mut self, source: Option<&str>) {
+        if let Some(source) = source {
+            let source = normalize_source(source);
+            if !source.is_empty() {
+                self.spec_pending.retain(|(known, _)| known != source);
+            }
+        }
+    }
+
+    /// The speaker's most recent record that carries original text, whether
+    /// or not the sentence is still open (mirrors the desktop's nearest
+    /// original-sentence binding for id-less translation tokens).
+    fn latest_source_record_index(&self, speaker: &SpeakerKey) -> Option<usize> {
+        self.sentences
+            .iter()
+            .rposition(|record| &record.speaker == speaker && !record.source.text.is_empty())
+    }
+
+    /// The most recent record whose source text equals `source` exactly. The
+    /// backend keys speculative frames by exact source text, so the match is
+    /// exact (a revised recognition simply does not match, same as desktop).
+    fn find_record_by_source_text(&self, source: &str) -> Option<usize> {
+        let source = normalize_source(source);
+        self.sentences
+            .iter()
+            .rposition(|record| normalize_source(&record.source.text) == source)
     }
 
     fn replay_pending_refinements(&mut self) {
@@ -433,6 +695,10 @@ impl TranscriptState {
     }
 }
 
+fn normalize_source(source: &str) -> &str {
+    source.trim()
+}
+
 fn sentence_id_conflicts(streaming: Option<&str>, incoming: Option<&str>) -> bool {
     match (streaming, incoming) {
         (Some(a), Some(b)) => a != b,
@@ -493,6 +759,7 @@ mod tests {
             sentence_id: id.into(),
             text: text.into(),
             language: Some("fr".into()),
+            source: None,
         })
     }
 
@@ -621,12 +888,24 @@ mod tests {
     }
 
     #[test]
-    fn target_without_id_is_dropped_when_no_open_sentence() {
+    fn target_without_id_binds_to_the_most_recent_original_sentence() {
+        // The source is already committed: the desktop still binds the late
+        // id-less streaming translation to that sentence, not to nothing.
         let mut s = TranscriptState::default();
         s.apply(&s_commit("1", "A", "done"), Instant::now());
-        s.apply(&t_draft("1", None, "orphan"), Instant::now());
+        s.apply(&t_draft("1", None, "late draft"), Instant::now());
         assert_eq!(s.sentences.len(), 1);
-        assert_eq!(s.sentences[0].target.phase, TrackPhase::Empty);
+        assert_eq!(s.sentences[0].target.text, "late draft");
+        assert_eq!(s.sentences[0].target.phase, TrackPhase::Draft);
+    }
+
+    #[test]
+    fn target_without_id_and_no_original_becomes_its_own_sentence() {
+        let mut s = TranscriptState::default();
+        s.apply(&t_draft("1", None, "translation only"), Instant::now());
+        assert_eq!(s.sentences.len(), 1);
+        assert_eq!(s.sentences[0].source.phase, TrackPhase::Empty);
+        assert_eq!(s.sentences[0].target.text, "translation only");
     }
 
     #[test]
@@ -728,30 +1007,42 @@ mod tests {
     }
 
     #[test]
-    fn clear_true_is_per_track() {
-        // committed source + draft target -> source kept, target reset
+    fn clear_true_finalizes_drafts_instead_of_dropping_them() {
+        // committed source + draft target -> both kept, draft promoted
         let mut s = TranscriptState::default();
         s.apply(&s_commit("1", "A", "a"), Instant::now());
         s.apply(&t_draft("1", Some("A"), "draft"), Instant::now());
         s.clear(true);
         assert_eq!(s.sentences.len(), 1);
         assert_eq!(s.sentences[0].source.phase, TrackPhase::Committed);
-        assert_eq!(s.sentences[0].target.phase, TrackPhase::Empty);
+        assert_eq!(s.sentences[0].target.phase, TrackPhase::Committed);
+        assert_eq!(s.sentences[0].target.text, "draft");
 
-        // draft source + committed target -> target kept, source reset
+        // draft source + committed target -> both kept, draft promoted
         let mut s = TranscriptState::default();
         s.apply(&s_live("2", "draft src"), Instant::now());
         s.apply(&t_commit("2", "B", "final tgt"), Instant::now());
         s.clear(true);
         assert_eq!(s.sentences.len(), 1);
-        assert_eq!(s.sentences[0].source.phase, TrackPhase::Empty);
+        assert_eq!(s.sentences[0].source.phase, TrackPhase::Committed);
+        assert_eq!(s.sentences[0].source.text, "draft src");
         assert_eq!(s.sentences[0].target.phase, TrackPhase::Committed);
 
-        // neither settled -> dropped
+        // an empty record with no content is dropped
         let mut s = TranscriptState::default();
-        s.apply(&s_live("3", "only draft"), Instant::now());
+        s.apply(&t_draft("3", Some("C"), "tgt only"), Instant::now());
+        s.apply(
+            &CaptionEvent::Retract {
+                sentence_id: "C".into(),
+                replacement_sentence_id: None,
+                reason: None,
+            },
+            Instant::now(),
+        );
+        s.apply(&t_draft("3", Some("D"), "kept"), Instant::now());
         s.clear(true);
-        assert!(s.sentences.is_empty());
+        assert_eq!(s.sentences.len(), 1);
+        assert_eq!(s.sentences[0].target.text, "kept");
     }
 
     #[test]
@@ -763,5 +1054,90 @@ mod tests {
         assert!(s.dismiss_settled_live(&SpeakerKey::Diarized("1".into()), Some("A")));
         assert!(matches!(s.live_input, LiveInputRow::Hidden));
         assert!(!s.dismiss_settled_live(&SpeakerKey::Diarized("1".into()), Some("A")));
+    }
+
+    #[test]
+    fn retracted_id_rejects_late_source_target_and_live_events() {
+        let mut s = TranscriptState::default();
+        let now = Instant::now();
+        s.apply(
+            &CaptionEvent::SourceLive(LiveSourceSnapshot {
+                speaker: SpeakerKey::Diarized("1".into()),
+                sentence_id: Some("A".into()),
+                text: "old live".into(),
+                language: Some("en".into()),
+            }),
+            now,
+        );
+        s.apply(&s_commit("1", "A", "old source"), now);
+        s.apply(
+            &CaptionEvent::Retract {
+                sentence_id: "A".into(),
+                replacement_sentence_id: Some("M".into()),
+                reason: Some("short_interrupt".into()),
+            },
+            now,
+        );
+        s.apply(&s_commit("1", "A", "late source"), now);
+        s.apply(&t_commit("1", "A", "late target"), now);
+
+        assert!(s.sentence_by_upstream_id("A").is_none());
+        assert!(matches!(s.live_input, LiveInputRow::Hidden));
+    }
+
+    #[test]
+    fn full_clear_discards_retracted_and_speculative_session_state() {
+        let mut s = TranscriptState::default();
+        let now = Instant::now();
+        s.apply(
+            &CaptionEvent::Retract {
+                sentence_id: "A".into(),
+                replacement_sentence_id: None,
+                reason: None,
+            },
+            now,
+        );
+        s.apply(
+            &CaptionEvent::SpecTranslation(SpecTranslation {
+                source: "hello".into(),
+                translation: "stale".into(),
+                target_lang: Some("fr".into()),
+            }),
+            now,
+        );
+
+        s.clear(false);
+        s.apply(&s_commit("1", "A", "hello"), now);
+
+        let record = s
+            .sentence_by_upstream_id("A")
+            .expect("new session accepts A");
+        assert!(record.target.text.is_empty());
+        assert!(!s.is_retracted("A"));
+    }
+
+    #[test]
+    fn speculative_translation_trims_source_and_reuses_cached_result() {
+        let mut s = TranscriptState::default();
+        let now = Instant::now();
+        s.apply(&s_commit("1", "A", " hello "), now);
+        s.apply(
+            &CaptionEvent::SpecTranslation(SpecTranslation {
+                source: "hello".into(),
+                translation: "bonjour".into(),
+                target_lang: Some("fr".into()),
+            }),
+            now,
+        );
+        assert_eq!(
+            s.sentence_by_upstream_id("A").unwrap().target.text,
+            "bonjour"
+        );
+
+        s.apply(&s_commit("1", "B", "hello"), now);
+        assert_eq!(
+            s.sentence_by_upstream_id("B").unwrap().target.text,
+            "bonjour"
+        );
     }
 }

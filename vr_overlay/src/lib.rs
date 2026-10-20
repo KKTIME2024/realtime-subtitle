@@ -36,6 +36,7 @@ pub use runtime::{
 pub use state::OverlayCalibration;
 pub use transcript::{
     CaptionEvent, CommittedSource, LiveInputRow, LiveSourceSnapshot, Refinement, SentenceKey,
-    SentenceRecord, SpeakerKey, TargetUpdate, TextTrack, TrackPhase, TranscriptState,
+    SentenceRecord, SeparatorKind, SpeakerKey, SpecTranslation, TargetUpdate, TextTrack,
+    TrackPhase, TranscriptState,
 };
 pub use views::{DisplayMode, SettingsError, VrViewSettings};

@@ -109,6 +109,63 @@ fn translation_capacity_evicts_least_recent_speaker() {
 }
 
 #[test]
+fn consecutive_sentences_from_one_speaker_share_one_original_row() {
+    let mut state = TranscriptState::default();
+    let now = Instant::now();
+    state.apply(&commit("1", "A", "First sentence."), now);
+    state.apply(&commit("1", "B", " Second sentence."), now);
+
+    let projection = project(&state, &settings(DisplayMode::Original, 3, 1), now);
+
+    assert_eq!(
+        text_at(&projection.frame, 3),
+        Some("First sentence. Second sentence.")
+    );
+    assert_eq!(projection.frame.slots[1], None);
+    assert_eq!(projection.frame.slots[2], None);
+}
+
+#[test]
+fn consecutive_bilingual_sentences_share_one_pair() {
+    let mut state = TranscriptState::default();
+    let now = Instant::now();
+    state.apply(&commit("1", "A", "First."), now);
+    state.apply(&t_commit("1", "A", "Premier."), now);
+    state.apply(&commit("1", "B", " Second."), now);
+    state.apply(&t_commit("1", "B", " Deuxieme."), now);
+
+    let projection = project(&state, &settings(DisplayMode::Both, 3, 2), now);
+
+    assert_eq!(projection.frame.slots[0], None);
+    assert_eq!(projection.frame.slots[1], None);
+    assert_eq!(text_at(&projection.frame, 2), Some("Premier. Deuxieme."));
+    assert_eq!(text_at(&projection.frame, 3), Some("First. Second."));
+}
+
+#[test]
+fn speculative_pending_projects_a_visible_placeholder_row() {
+    let mut state = TranscriptState::default();
+    let now = Instant::now();
+    state.apply(&commit("1", "A", "hello"), now);
+    state.apply(
+        &CaptionEvent::SpecPending {
+            source: "hello".into(),
+            target_lang: Some("fr".into()),
+        },
+        now,
+    );
+
+    let projection = project(&state, &settings(DisplayMode::Both, 3, 1), now);
+    let target = projection.frame.slots[2]
+        .as_ref()
+        .expect("pending translation placeholder");
+    assert_eq!(target.text, "\u{00a0}");
+    assert_eq!(target.kind, HudRowKind::Draft);
+    assert_eq!(target.language.as_deref(), Some("fr"));
+    assert_eq!(text_at(&projection.frame, 3), Some("hello"));
+}
+
+#[test]
 fn live_input_never_renders_a_speaker_number() {
     let mut state = TranscriptState::default();
     let now = Instant::now();
@@ -127,7 +184,7 @@ fn live_input_never_renders_a_speaker_number() {
 }
 
 #[test]
-fn translation_shows_only_the_newest_target_per_speaker() {
+fn translation_concatenates_the_current_speaker_segment() {
     let mut state = TranscriptState::default();
     let now = Instant::now();
     state.apply(&commit("1", "A", "a"), now);
@@ -139,7 +196,7 @@ fn translation_shows_only_the_newest_target_per_speaker() {
             &project(&state, &settings(DisplayMode::Translation, 3, 1), now).frame,
             3
         ),
-        Some("bee")
+        Some("aybee")
     );
     state.apply(&t_commit("1", "A", "ay2"), now);
     assert_eq!(
@@ -147,7 +204,7 @@ fn translation_shows_only_the_newest_target_per_speaker() {
             &project(&state, &settings(DisplayMode::Translation, 3, 1), now).frame,
             3
         ),
-        Some("bee")
+        Some("ay2bee")
     );
 }
 
@@ -199,7 +256,7 @@ fn both_mode_one_pair_occupies_slots_two_and_three() {
 }
 
 #[test]
-fn both_mode_two_pairs_occupy_slots_zero_through_three() {
+fn both_mode_concatenates_consecutive_pairs_from_one_speaker() {
     let mut state = TranscriptState::default();
     let now = Instant::now();
     for id in ["A", "B"] {
@@ -207,19 +264,19 @@ fn both_mode_two_pairs_occupy_slots_zero_through_three() {
         state.apply(&t_draft("1", id, &format!("t{id}")), now);
     }
     let projection = project(&state, &settings(DisplayMode::Both, 3, 2), now);
-    assert_eq!(text_at(&projection.frame, 0), Some("tA"));
-    assert_eq!(text_at(&projection.frame, 1), Some("A"));
-    assert_eq!(text_at(&projection.frame, 2), Some("tB"));
-    assert_eq!(text_at(&projection.frame, 3), Some("B"));
+    assert_eq!(projection.frame.slots[0], None);
+    assert_eq!(projection.frame.slots[1], None);
+    assert_eq!(text_at(&projection.frame, 2), Some("tAtB"));
+    assert_eq!(text_at(&projection.frame, 3), Some("AB"));
 }
 
 #[test]
 fn both_mode_evicts_the_oldest_pair_beyond_capacity() {
     let mut state = TranscriptState::default();
     let now = Instant::now();
-    for id in ["A", "B", "C"] {
-        state.apply(&commit("1", id, id), now);
-        state.apply(&t_draft("1", id, &format!("t{id}")), now);
+    for (speaker, id) in [("1", "A"), ("2", "B"), ("3", "C")] {
+        state.apply(&commit(speaker, id, id), now);
+        state.apply(&t_draft(speaker, id, &format!("t{id}")), now);
     }
     let projection = project(&state, &settings(DisplayMode::Both, 3, 2), now);
     assert_eq!(text_at(&projection.frame, 0), Some("tB"));

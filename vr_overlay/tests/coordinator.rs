@@ -181,7 +181,7 @@ fn unchanged_projection_does_not_submit_a_texture() {
 }
 
 #[test]
-fn correlation_metadata_change_does_not_submit_identical_visuals() {
+fn new_sentence_with_repeated_text_extends_the_visible_segment() {
     let mut coordinator = RuntimeCoordinator::for_test();
     coordinator.apply_settings_for_test(VrViewSettings {
         display_mode: DisplayMode::Original,
@@ -196,7 +196,13 @@ fn correlation_metadata_change_does_not_submit_identical_visuals() {
     );
     coordinator.render_for_test(t + Duration::from_millis(1));
 
-    assert_eq!(coordinator.submit_count_for_test(), 1);
+    assert_eq!(coordinator.submit_count_for_test(), 2);
+    assert_eq!(
+        coordinator.last_frame_for_test().slots[3]
+            .as_ref()
+            .map(|row| row.text.as_str()),
+        Some("same textsame text")
+    );
 }
 
 #[test]
@@ -273,6 +279,30 @@ fn committed_visible_source_wakes_a_hidden_overlay() {
     coordinator.push_for_test(source_commit("1", "A", "final source"), t);
 
     let visibility = coordinator.tick(t);
+    assert_eq!(visibility.set_visible, Some(true));
+    assert_eq!(visibility.alpha, Some(1.0));
+}
+
+#[test]
+fn speculative_pending_placeholder_wakes_translation_mode() {
+    let mut coordinator = RuntimeCoordinator::for_test();
+    coordinator.apply_settings_for_test(VrViewSettings {
+        display_mode: DisplayMode::Translation,
+        ..Default::default()
+    });
+    let t = coordinator.now_for_test();
+    coordinator.push_for_test(source_commit("1", "A", "hello"), t);
+    assert_eq!(coordinator.tick(t).set_visible, None);
+
+    coordinator.push_for_test(
+        CaptionEvent::SpecPending {
+            source: "hello".into(),
+            target_lang: Some("fr".into()),
+        },
+        t + Duration::from_millis(1),
+    );
+
+    let visibility = coordinator.tick(t + Duration::from_millis(1));
     assert_eq!(visibility.set_visible, Some(true));
     assert_eq!(visibility.alpha, Some(1.0));
 }

@@ -97,5 +97,6 @@ pub fn refine(id: &str, text: &str) -> CaptionEvent {
         sentence_id: id.into(),
         text: text.into(),
         language: Some("fr".into()),
+        source: None,
     })
 }

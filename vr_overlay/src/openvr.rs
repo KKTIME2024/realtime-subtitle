@@ -280,6 +280,10 @@ impl OpenVrOverlay {
     pub fn compositor_heartbeat(&self) {
         self.backend.compositor_heartbeat();
     }
+
+    pub fn dxgi_adapter_index(&self) -> Result<u32, OpenVrError> {
+        self.backend.dxgi_adapter_index()
+    }
 }
 
 impl OverlayFrameSubmitter for OpenVrOverlay {
@@ -446,6 +450,21 @@ impl OpenVrBackend {
         #[cfg(windows)]
         openvr.compositor_heartbeat();
     }
+
+    fn dxgi_adapter_index(&self) -> Result<u32, OpenVrError> {
+        match self {
+            #[cfg(windows)]
+            Self::Windows(openvr) => openvr.dxgi_adapter_index(),
+            #[cfg(not(windows))]
+            Self::Test(_) => Ok(0),
+        }
+    }
+}
+
+fn dxgi_adapter_index_from(get_output_info: impl FnOnce(&mut i32)) -> Result<u32, OpenVrError> {
+    let mut index = -1;
+    get_output_info(&mut index);
+    u32::try_from(index).map_err(|_| OpenVrError::Init("OpenVR returned no DXGI adapter".into()))
 }
 
 #[cfg(windows)]
@@ -596,6 +615,13 @@ impl WindowsOpenVrOverlay {
         self.last_visibility_api_call_log.take()
     }
 
+    fn dxgi_adapter_index(&self) -> Result<u32, OpenVrError> {
+        let get_output_info = self.system_api().GetDXGIOutputInfo.ok_or_else(|| {
+            OpenVrError::Init("missing OpenVR system method: GetDXGIOutputInfo".into())
+        })?;
+        dxgi_adapter_index_from(|index| unsafe { get_output_info(index) })
+    }
+
     fn display_refresh_rate_hz(&self) -> Option<f32> {
         const PROP_DISPLAY_FREQUENCY_FLOAT: openvr_sys::ETrackedDeviceProperty = 2002;
 
@@ -713,10 +739,7 @@ pub(crate) fn format_openvr_visibility_api_call_log(
 ) -> String {
     format!(
         "openvr_overlay_visibility_api_call desired_visible={} cached_visible_before={} api={} cached_visible_after={}",
-        desired_visible,
-        cached_visible_before,
-        api,
-        cached_visible_after,
+        desired_visible, cached_visible_before, api, cached_visible_after,
     )
 }
 
@@ -923,11 +946,18 @@ mod tests {
     use std::cell::Cell;
 
     use super::{
-        fn_table_interface_version, run_startup_preflight, FakeOpenVr, OpenVrBackgroundInitError,
-        OpenVrPreflightApi, OpenVrStartupPreflightError, OverlayFrameSubmitter,
-        OverlayPlacementPolicy,
+        dxgi_adapter_index_from, fn_table_interface_version, run_startup_preflight, FakeOpenVr,
+        OpenVrBackgroundInitError, OpenVrPreflightApi, OpenVrStartupPreflightError,
+        OverlayFrameSubmitter, OverlayPlacementPolicy,
     };
     use crate::state::OverlayCalibration;
+
+    #[test]
+    fn dxgi_adapter_index_comes_from_openvr() {
+        let adapter_index = dxgi_adapter_index_from(|index| *index = 2).unwrap();
+
+        assert_eq!(adapter_index, 2);
+    }
 
     enum FakeBackgroundInitResult {
         Ok,

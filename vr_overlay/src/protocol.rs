@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::ErrorKind;
 
 use futures_util::StreamExt;
@@ -10,7 +10,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::manifest::OverlayManifest;
 use crate::transcript::{
-    CaptionEvent, CommittedSource, LiveSourceSnapshot, Refinement, SpeakerKey, TargetUpdate,
+    CaptionEvent, CommittedSource, LiveSourceSnapshot, Refinement, SeparatorKind, SpeakerKey,
+    SpecTranslation, TargetUpdate,
 };
 use crate::views::VrViewSettings;
 
@@ -39,22 +40,11 @@ struct AccumKey {
     track: TrackKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FinalTokenFingerprint {
-    is_separator: bool,
-    track: TrackKind,
-    speaker: SpeakerKey,
-    sentence_id: Option<String>,
-    text: String,
-    language: Option<String>,
-}
-
 pub struct DesktopProtocol {
     stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     pending: VecDeque<CaptionEvent>,
     accumulators: BTreeMap<AccumKey, String>,
-    replace_on_next: BTreeMap<AccumKey, bool>,
-    previous_final_fingerprint: Option<Vec<FinalTokenFingerprint>>,
+    retracted_ids: BTreeSet<String>,
 }
 
 impl DesktopProtocol {
@@ -69,8 +59,7 @@ impl DesktopProtocol {
             stream,
             pending: VecDeque::new(),
             accumulators: BTreeMap::new(),
-            replace_on_next: BTreeMap::new(),
-            previous_final_fingerprint: None,
+            retracted_ids: BTreeSet::new(),
         })
     }
 
@@ -126,6 +115,9 @@ impl DesktopProtocol {
         match map.get("type").and_then(Value::as_str) {
             Some("update") => self.process_update(&map),
             Some("refine_result") => self.process_refine(&map),
+            Some("subtitle_retract") => self.process_retract(&map),
+            Some("spec_translation_pending") => self.process_spec_pending(&map),
+            Some("spec_translation") => self.process_spec_translation(&map),
             Some("clear") => {
                 let preserve_existing = match map.get("preserve_existing") {
                     None => false,
@@ -137,9 +129,15 @@ impl DesktopProtocol {
                         }
                     },
                 };
-                self.accumulators.clear();
-                self.replace_on_next.clear();
-                self.previous_final_fingerprint = None;
+                // A preserve_existing rollover keeps sentence ids alive: the
+                // same sentence may keep receiving final tokens on the new
+                // stream, so the per-sentence accumulators must survive.
+                // Only a full clear starts a fresh id space (the backend
+                // regenerates its session id on a full session restart).
+                if !preserve_existing {
+                    self.accumulators.clear();
+                    self.retracted_ids.clear();
+                }
                 self.pending
                     .push_back(CaptionEvent::Clear { preserve_existing });
             }
@@ -168,19 +166,17 @@ impl DesktopProtocol {
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let fingerprint = Self::fingerprint(final_tokens);
-        let replayed = self.previous_final_fingerprint.as_ref() == Some(&fingerprint);
-        self.previous_final_fingerprint = Some(fingerprint);
-        if !replayed {
-            self.accumulate_final_tokens(final_tokens);
-        }
+        self.accumulate_final_tokens(final_tokens);
         self.emit_non_final(map);
     }
 
-    /// Final tokens accumulate per `(sentence_id, speaker, track)`. Each frame
-    /// contributes the concatenation of that key's tokens; a strictly longer
-    /// cumulative prefix replaces the accumulator, otherwise the frame's text
-    /// is appended as a true delta.
+    /// `final_tokens` is an ordered incremental delta: the backend sends each
+    /// final token exactly once (it tracks `sent_count` per stream) and the
+    /// desktop reference appends unconditionally. Each frame's tokens are
+    /// therefore appended to the per-`(sentence_id, speaker, track)`
+    /// accumulator; the emitted event always carries the full accumulated
+    /// text. Repeated text across frames is valid content and is never
+    /// deduplicated.
     fn accumulate_final_tokens(&mut self, tokens: &[Value]) {
         let mut groups: Vec<(AccumKey, String, Option<String>)> = Vec::new();
         for token in tokens {
@@ -193,10 +189,7 @@ impl DesktopProtocol {
                 .unwrap_or(false)
             {
                 self.flush_final_groups(&mut groups);
-                let keys = self.accumulators.keys().cloned().collect::<Vec<_>>();
-                for key in keys {
-                    self.replace_on_next.insert(key, true);
-                }
+                self.emit_separator(token);
                 continue;
             }
             if token.get("is_final").and_then(Value::as_bool) == Some(false) {
@@ -208,6 +201,12 @@ impl DesktopProtocol {
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map(str::to_owned);
+            if sentence_id
+                .as_deref()
+                .is_some_and(|id| self.retracted_ids.contains(id))
+            {
+                continue;
+            }
             let speaker = speaker_from(token);
             let language = token
                 .get("language")
@@ -243,18 +242,37 @@ impl DesktopProtocol {
         self.flush_final_groups(&mut groups);
     }
 
+    /// A separator is a display line break, not a sentence boundary in the
+    /// id-keyed model: id-keyed accumulators are untouched (late translations
+    /// for a closed sentence keep their old id and must keep appending).
+    /// Only the id-less source track (IPC-injected text, which has no
+    /// sentence id) resets, so each displayed IPC segment starts fresh.
+    fn emit_separator(&mut self, token: &Map<String, Value>) {
+        let kind = match token.get("separator_type").and_then(Value::as_str) {
+            Some("punctuation") => SeparatorKind::Punctuation,
+            Some("translation") => SeparatorKind::Translation,
+            Some("endpoint") => SeparatorKind::Endpoint,
+            Some("speaker_change") => SeparatorKind::SpeakerChange,
+            Some("interrupt_repair") => SeparatorKind::InterruptRepair,
+            Some("reconnect") => SeparatorKind::Reconnect,
+            _ => SeparatorKind::Unknown,
+        };
+        let idless_source_keys: Vec<AccumKey> = self
+            .accumulators
+            .keys()
+            .filter(|key| key.sentence_id.is_none() && key.track == TrackKind::Source)
+            .cloned()
+            .collect();
+        for key in idless_source_keys {
+            self.accumulators.remove(&key);
+        }
+        self.pending.push_back(CaptionEvent::Separator { kind });
+    }
+
     fn flush_final_groups(&mut self, groups: &mut Vec<(AccumKey, String, Option<String>)>) {
         for (key, text, language) in groups.drain(..) {
-            let replace = self.replace_on_next.remove(&key).unwrap_or(false);
             let accumulator = self.accumulators.entry(key.clone()).or_default();
-            if replace
-                || accumulator.is_empty()
-                || (text.starts_with(accumulator.as_str()) && text.len() > accumulator.len())
-            {
-                accumulator.clone_from(&text);
-            } else {
-                accumulator.push_str(&text);
-            }
+            accumulator.push_str(&text);
             let full_text = accumulator.clone();
             let event = match key.track {
                 TrackKind::Source => CaptionEvent::SourceCommitted(CommittedSource {
@@ -357,9 +375,39 @@ impl DesktopProtocol {
         }
     }
 
+    /// `refine_result` carries the sentence id, the source text, the draft
+    /// (`original_translation`), the refined value (`refined_translation`,
+    /// null when `no_change`), and the target language. `no_change: true`
+    /// confirms the existing translation; it is not a no-op.
     fn process_refine(&mut self, map: &Map<String, Value>) {
-        if map.get("no_change").and_then(Value::as_bool) == Some(true) {
+        let Some(sentence_id) = map
+            .get("sentence_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
             self.pending.push_back(CaptionEvent::Activity);
+            return;
+        };
+        let source = map
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let language = map
+            .get("target_lang")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let no_change = map
+            .get("no_change")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if no_change {
+            self.pending.push_back(CaptionEvent::TargetConfirmed {
+                sentence_id: sentence_id.to_owned(),
+                source,
+            });
             return;
         }
         let refined = map
@@ -377,14 +425,6 @@ impl DesktopProtocol {
         } else {
             refined
         };
-        let Some(sentence_id) = map
-            .get("sentence_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        else {
-            self.pending.push_back(CaptionEvent::Activity);
-            return;
-        };
         if text.is_empty() {
             self.pending.push_back(CaptionEvent::Activity);
             return;
@@ -393,37 +433,96 @@ impl DesktopProtocol {
             .push_back(CaptionEvent::RefinedTarget(Refinement {
                 sentence_id: sentence_id.to_owned(),
                 text: text.to_owned(),
-                language: None,
+                language,
+                source,
             }));
     }
 
-    fn fingerprint(tokens: &[Value]) -> Vec<FinalTokenFingerprint> {
-        tokens
-            .iter()
-            .filter_map(Value::as_object)
-            .map(|token| FinalTokenFingerprint {
-                is_separator: token
-                    .get("is_separator")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                track: track_from(token),
-                speaker: speaker_from(token),
-                sentence_id: token
-                    .get("llm_sentence_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
-                text: token
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-                language: token
-                    .get("language")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-            .collect()
+    /// `subtitle_retract` removes a retracted sentence by id. The backend
+    /// re-emits the merged replacement as fresh final tokens under
+    /// `replacement_sentence_id`, so no local reconstruction is needed.
+    fn process_retract(&mut self, map: &Map<String, Value>) {
+        let Some(sentence_id) = map
+            .get("sentence_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            self.pending.push_back(CaptionEvent::Activity);
+            return;
+        };
+        let sentence_id = sentence_id.trim();
+        if sentence_id.is_empty() {
+            self.pending.push_back(CaptionEvent::Activity);
+            return;
+        }
+        self.retracted_ids.insert(sentence_id.to_owned());
+        self.accumulators
+            .retain(|key, _| key.sentence_id.as_deref() != Some(sentence_id));
+        let replacement = map
+            .get("replacement_sentence_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        let reason = map.get("reason").and_then(Value::as_str).map(str::to_owned);
+        self.pending.push_back(CaptionEvent::Retract {
+            sentence_id: sentence_id.to_owned(),
+            replacement_sentence_id: replacement,
+            reason,
+        });
+    }
+
+    fn process_spec_pending(&mut self, map: &Map<String, Value>) {
+        let Some(source) = map
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            self.pending.push_back(CaptionEvent::Activity);
+            return;
+        };
+        let target_lang = map
+            .get("target_lang")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self.pending.push_back(CaptionEvent::SpecPending {
+            source: source.to_owned(),
+            target_lang,
+        });
+    }
+
+    fn process_spec_translation(&mut self, map: &Map<String, Value>) {
+        let Some(source) = map
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            self.pending.push_back(CaptionEvent::Activity);
+            return;
+        };
+        let translation = map
+            .get("translation")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if translation.is_empty() {
+            self.pending.push_back(CaptionEvent::Activity);
+            return;
+        }
+        let target_lang = map
+            .get("target_lang")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        self.pending
+            .push_back(CaptionEvent::SpecTranslation(SpecTranslation {
+                source: source.to_owned(),
+                translation,
+                target_lang,
+            }));
     }
 }
 

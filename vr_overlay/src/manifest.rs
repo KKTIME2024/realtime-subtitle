@@ -58,7 +58,7 @@ impl TryFrom<OverlayManifestSerde> for OverlayManifest {
             (None, None) => {
                 return Err(StartupError::Manifest(
                     "missing field `logging_mode`".to_string(),
-                ))
+                ));
             }
         };
 

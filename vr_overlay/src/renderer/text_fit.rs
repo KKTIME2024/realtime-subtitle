@@ -114,6 +114,317 @@ pub(crate) fn fit_row_text_with_measure(
     }
 }
 
+/// A page inside one physical HUD row. The left edge stays fixed while text
+/// grows; overflowing text starts a new page with a small amount of context.
+/// No timers or transcript mutations are involved. Revisions reflow from the
+/// beginning, so cached and fresh layouts have the same result.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PagedRowText {
+    source: String,
+    page_start: usize,
+    budget: Option<f32>,
+}
+
+impl PagedRowText {
+    pub(crate) fn can_continue(&self, text: &str, max_advance: f32) -> bool {
+        if self.budget != Some(max_advance) || !text.starts_with(&self.source) {
+            return false;
+        }
+        // An appended scalar can extend the previous grapheme (e.g. an emoji
+        // modifier or the second regional indicator). Reflow in that case;
+        // the old byte offset may no longer be a cluster boundary.
+        let next = text[self.source.len()..].chars().next();
+        !next.is_some_and(|ch| {
+            is_combining(ch)
+                || self.source.chars().next_back().is_some_and(|previous| {
+                    joins_following(previous)
+                        || (is_regional_indicator(previous) && is_regional_indicator(ch))
+                })
+        })
+    }
+
+    pub(crate) fn fit(
+        &mut self,
+        text: &str,
+        max_advance: f32,
+        measure: &dyn Fn(&str) -> f32,
+    ) -> String {
+        if !self.can_continue(text, max_advance) {
+            self.page_start = 0;
+        }
+        self.source = text.to_owned();
+        self.budget = Some(max_advance);
+        if max_advance.is_nan() || max_advance == f32::INFINITY {
+            return text.to_owned();
+        }
+        if max_advance <= 0.0 {
+            self.page_start = 0;
+            return String::new();
+        }
+
+        // Usually only this measurement is needed on an appended token. The
+        // historical pages are not reshaped on every frame.
+        let tail = &text[self.page_start..];
+        if measure(tail) <= max_advance {
+            return tail.to_owned();
+        }
+
+        let parts = clusters(tail);
+        let mut start = 0;
+        let mut byte_start = self.page_start;
+        while start < parts.len() {
+            let mut prefix = String::new();
+            let mut widths = vec![0.0];
+            let mut end = start;
+            while end < parts.len() {
+                prefix.push_str(&parts[end]);
+                let width = measure(&prefix);
+                if width > max_advance {
+                    break;
+                }
+                widths.push(width);
+                end += 1;
+            }
+            if end == parts.len() {
+                break;
+            }
+            let next = if end == start {
+                // An indivisible cluster wider than the entire row cannot be
+                // rendered at this scale. Skip it without splitting it.
+                start + 1
+            } else {
+                next_page_start(&parts, start, end, &widths, max_advance)
+            };
+            byte_start += parts[start..next].iter().map(String::len).sum::<usize>();
+            start = next;
+        }
+        self.page_start = byte_start;
+        text[byte_start..].to_owned()
+    }
+}
+
+/// Decide using only the full page and its first overflowing cluster. This
+/// makes the page boundaries independent of WebSocket token batching.
+fn next_page_start(
+    parts: &[String],
+    start: usize,
+    end: usize,
+    widths: &[f32],
+    budget: f32,
+) -> usize {
+    let visible = &parts[..=end];
+    let readable = |index: usize| {
+        !cluster_base(&parts[index]).is_whitespace()
+            && !is_closing_punctuation(cluster_base(&parts[index]))
+    };
+    // A clause beginning in the latter half of the page is the strongest
+    // anchor. Keep it intact, even if this carries more than a quarter line.
+    for index in ((start + 1)..=end).rev() {
+        if widths[index - start] < budget * 0.5 || !readable(index) {
+            continue;
+        }
+        let mut previous = index - 1;
+        while previous > start && cluster_base(&parts[previous]).is_whitespace() {
+            previous -= 1;
+        }
+        if is_natural_break_punctuation(visible, previous) {
+            return index;
+        }
+    }
+    // Otherwise carry roughly the last quarter line, starting at a word
+    // boundary. CJK without punctuation / oversized words fall back to whole
+    // clusters, still advancing in pages rather than one character at a time.
+    let preferred = ((start + 1)..=end)
+        .find(|index| widths[index - start] >= budget * 0.75)
+        .unwrap_or(end);
+    for index in preferred..=end {
+        if readable(index) && is_natural_boundary_before(visible, index) {
+            return index;
+        }
+    }
+    (preferred..=end)
+        .find(|index| readable(*index))
+        .unwrap_or(preferred)
+}
+
+/// Historical sliding-window fit, retained for regression comparisons.
+///
+/// When a growing display segment exceeds one physical line, the initial hard-cut
+/// suffix is moved forward to the nearest natural boundary when one exists;
+/// otherwise it remains a complete-cluster hard cut.
+#[allow(dead_code)]
+pub(crate) fn fit_newest_text_with_measure(
+    text: &str,
+    max_advance: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if max_advance.is_nan() || max_advance == f32::INFINITY {
+        return text.to_owned();
+    }
+    if max_advance == f32::NEG_INFINITY {
+        return String::new();
+    }
+    let max = max_advance.max(0.0);
+    if measure(text) <= max {
+        return text.to_owned();
+    }
+
+    let clusters = clusters(text);
+    let mut kept: Vec<String> = Vec::new();
+    for cluster in clusters.iter().rev() {
+        let mut candidate = cluster.clone();
+        for existing in kept.iter().rev() {
+            candidate.push_str(existing);
+        }
+        if measure(&candidate) > max {
+            break;
+        }
+        kept.push(cluster.clone());
+    }
+    kept.reverse();
+
+    let hard_start = clusters.len().saturating_sub(kept.len());
+    let natural_start = nearest_natural_window_start(&clusters, hard_start);
+    kept = clusters[natural_start..].to_vec();
+
+    let mut candidate = kept.concat();
+    while measure(&candidate) > max && !kept.is_empty() {
+        kept.remove(0);
+        candidate = kept.concat();
+    }
+    candidate
+}
+
+/// Find the first readable boundary at or after the maximum-width hard cut.
+/// Searching forward keeps the newest text visible while discarding as little
+/// additional content as possible.
+fn nearest_natural_window_start(clusters: &[String], hard_start: usize) -> usize {
+    if hard_start >= clusters.len() {
+        return hard_start;
+    }
+
+    let trimmed_start = skip_window_whitespace(clusters, hard_start);
+    if trimmed_start >= clusters.len() {
+        return trimmed_start;
+    }
+    if trimmed_start != hard_start || is_natural_boundary_before(clusters, trimmed_start) {
+        return trimmed_start;
+    }
+
+    for start in (hard_start + 1)..clusters.len() {
+        if is_natural_boundary_before(clusters, start) {
+            return skip_window_whitespace(clusters, start);
+        }
+    }
+
+    hard_start
+}
+
+fn skip_window_whitespace(clusters: &[String], mut start: usize) -> usize {
+    while start < clusters.len() && cluster_base(&clusters[start]).is_whitespace() {
+        start += 1;
+    }
+    start
+}
+
+fn is_natural_boundary_before(clusters: &[String], start: usize) -> bool {
+    if start == 0 || start >= clusters.len() {
+        return start == 0;
+    }
+
+    let previous = cluster_base(&clusters[start - 1]);
+    let current = cluster_base(&clusters[start]);
+    previous.is_whitespace()
+        || is_natural_break_punctuation(clusters, start - 1)
+        || is_word_boundary(previous, current)
+}
+
+fn is_natural_break_punctuation(clusters: &[String], index: usize) -> bool {
+    let ch = cluster_base(&clusters[index]);
+    if ch == '.' {
+        let previous = index
+            .checked_sub(1)
+            .map(|previous| cluster_base(&clusters[previous]));
+        let next = clusters.get(index + 1).map(|next| cluster_base(next));
+        if previous == Some('.') || next == Some('.') {
+            return false;
+        }
+        if previous.is_some_and(|ch| ch.is_ascii_digit())
+            && next.is_some_and(|ch| ch.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+
+    matches!(
+        ch,
+        ',' | '.'
+            | '!'
+            | '?'
+            | ';'
+            | ':'
+            | '/'
+            | '\\'
+            | '-'
+            | '–'
+            | '—'
+            | '，'
+            | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '、'
+            | '｡'
+            | '､'
+    ) || is_closing_punctuation(ch)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Letter,
+    Number,
+    Cjk,
+    Other,
+}
+
+fn is_word_boundary(previous: char, current: char) -> bool {
+    let previous = word_class(previous);
+    let current = word_class(current);
+    previous != WordClass::Other && current != WordClass::Other && previous != current
+}
+
+fn word_class(ch: char) -> WordClass {
+    if is_cjk_word_character(ch) {
+        WordClass::Cjk
+    } else if ch.is_alphabetic() {
+        WordClass::Letter
+    } else if ch.is_numeric() {
+        WordClass::Number
+    } else {
+        WordClass::Other
+    }
+}
+
+fn is_cjk_word_character(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x2FDF
+            | 0x3040..=0x30FF
+            | 0x3100..=0x312F
+            | 0x31A0..=0x31BF
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x323AF
+    )
+}
+
 /// Final guard: guarantee the returned string's measured width never exceeds
 /// `max`, independent of floating-point summation order. Trims whole clusters
 /// from the appropriate end until the guard holds.
@@ -727,6 +1038,169 @@ mod tests {
         let result = fit_row_text("e\u{0301}xyz", 2.0, Truncation::Trailing, &advance);
         assert_eq!(result, "e\u{0301}…");
         assert_within(&result, 2.0, &advance);
+    }
+
+    #[test]
+    fn newest_window_moves_to_the_nearest_space_boundary() {
+        let result = fit_newest_text_with_measure("prefix hello world", 8.0, &|text| {
+            text.chars().count() as f32
+        });
+
+        assert_eq!(result, "world");
+    }
+
+    #[test]
+    fn newest_window_moves_to_the_nearest_english_punctuation_boundary() {
+        let result = fit_newest_text_with_measure("oldpart.New text", 10.0, &|text| {
+            text.chars().count() as f32
+        });
+
+        assert_eq!(result, "New text");
+    }
+
+    #[test]
+    fn newest_window_moves_to_the_nearest_cjk_punctuation_boundary() {
+        let result = fit_newest_text_with_measure("旧内容很长。新内容", 5.0, &|text| {
+            text.chars().count() as f32
+        });
+
+        assert_eq!(result, "新内容");
+    }
+
+    #[test]
+    fn newest_window_hard_cuts_by_cluster_when_no_boundary_exists() {
+        let result =
+            fit_newest_text_with_measure("abcdefgh", 4.0, &|text| text.chars().count() as f32);
+
+        assert_eq!(result, "efgh");
+    }
+
+    #[test]
+    fn newest_window_preserves_literal_ellipsis_content() {
+        let unicode = fit_newest_text_with_measure("prefix …actual", 7.0, &|text| {
+            text.chars().count() as f32
+        });
+        let ascii = fit_newest_text_with_measure("prefix ...actual", 9.0, &|text| {
+            text.chars().count() as f32
+        });
+
+        assert_eq!(unicode, "…actual");
+        assert_eq!(ascii, "...actual");
+    }
+
+    fn scalar_width(text: &str) -> f32 {
+        text.chars().count() as f32
+    }
+
+    #[test]
+    fn paged_row_keeps_the_clause_start_until_the_row_fills_again() {
+        let mut page = PagedRowText::default();
+        assert_eq!(
+            page.fit("Old words. New", 16.0, &scalar_width),
+            "Old words. New"
+        );
+        assert_eq!(
+            page.fit("Old words. New words", 16.0, &scalar_width),
+            "New words"
+        );
+        assert_eq!(
+            page.fit("Old words. New words grow", 16.0, &scalar_width),
+            "New words grow"
+        );
+    }
+
+    #[test]
+    fn paged_cjk_keeps_context_without_shifting_on_every_character() {
+        let mut page = PagedRowText::default();
+        let text = "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥";
+        let mut prefix = String::new();
+        let mut previous_start = 0;
+        let mut changes = 0;
+        for ch in text.chars() {
+            prefix.push(ch);
+            let fitted = page.fit(&prefix, 8.0, &scalar_width);
+            assert!(prefix.ends_with(&fitted));
+            assert!(scalar_width(&fitted) <= 8.0);
+            if page.page_start != previous_start {
+                changes += 1;
+                assert_eq!(
+                    fitted.chars().count(),
+                    3,
+                    "two old characters plus the new one"
+                );
+            }
+            previous_start = page.page_start;
+        }
+        assert_eq!(changes, 3, "not fourteen one-character shifts");
+        assert_eq!(
+            page.fit("旧的句子。新的句子长", 8.0, &scalar_width),
+            "新的句子长"
+        );
+    }
+
+    #[test]
+    fn pages_are_independent_of_token_batching_and_recover_from_revisions() {
+        let corpora = [
+            "The number is 3.14, and this is a much longer sentence. Next sentence.",
+            "我昨天去了一家新开的店，那里的拉面特别好吃。下次我们可以一起去。",
+            "これは長い字幕です。読み始めた場所を覚えておきたいですね。",
+            "prefix …actual ...content and words, with punctuation!",
+            "one (two) three — four/five six-seven end",
+            "abcdefghijklmno",
+            "🇯🇵🇺🇸 e\u{0301} 👨‍👩‍👧 क्ष 1\u{FE0F}\u{20E3} rest of sentence",
+        ];
+        let measure = |text: &str| measure_width(text, &zero_combining_advance());
+        for budget in [0.5, 1.0, 2.0, 4.5, 8.0, 16.0] {
+            let mut streamed = PagedRowText::default();
+            for text in corpora {
+                let mut prefix = String::new();
+                for ch in text.chars() {
+                    prefix.push(ch);
+                    let actual = streamed.fit(&prefix, budget, &measure);
+                    let fresh = PagedRowText::default().fit(&prefix, budget, &measure);
+                    assert_eq!(actual, fresh, "budget={budget}, input={prefix:?}");
+                    assert!(
+                        measure(&actual) <= budget,
+                        "input={prefix:?}, output={actual:?}"
+                    );
+                    assert!(prefix.ends_with(&actual));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paged_fit_preserves_clusters_and_literal_ellipses() {
+        let measure = |text: &str| clusters(text).len() as f32;
+        let mut page = PagedRowText::default();
+        assert_eq!(
+            page.fit("abcdef👨‍👩‍👧e\u{0301}🇯🇵", 8.0, &measure),
+            "👨‍👩‍👧e\u{0301}🇯🇵"
+        );
+        assert_eq!(page.fit("…actual", 8.0, &measure), "…actual");
+        assert_eq!(page.fit("...real", 8.0, &measure), "...real");
+        assert_eq!(page.fit("new", 0.0, &measure), "");
+        assert_eq!(page.fit("new", f32::INFINITY, &measure), "new");
+    }
+
+    #[test]
+    fn appending_within_a_page_does_not_measure_historical_text() {
+        use std::cell::Cell;
+        let mut page = PagedRowText::default();
+        let mut text = "abcdefgh".repeat(200);
+        page.fit(&text, 32.0, &scalar_width);
+        let calls = Cell::new(0);
+        text.push('z');
+        let fitted = page.fit(&text, 32.0, &|candidate| {
+            calls.set(calls.get() + 1);
+            assert!(
+                candidate.len() <= 32,
+                "must not remeasure the entire segment"
+            );
+            scalar_width(candidate)
+        });
+        assert!(fitted.ends_with('z'));
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

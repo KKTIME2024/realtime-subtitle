@@ -1807,9 +1807,9 @@ mod hud_frame_render_tests {
     }
 
     #[test]
-    fn hud_render_settled_row_uses_trailing_ellipsis_when_over_budget() {
+    fn hud_render_settled_row_keeps_real_newest_text_without_ellipsis() {
         let renderer = CaptionRenderer::new_for_test().unwrap();
-        let text = format!("BEGINNING{}", "x".repeat(400));
+        let text = format!("BEGINNING{}NEWESTTAIL", "x".repeat(400));
         let outcome = renderer
             .render_hud_frame(&frame(&[(
                 3,
@@ -1817,8 +1817,8 @@ mod hud_frame_render_tests {
             )]))
             .unwrap();
         let line = &block(outcome.frame.layout(), "slot-3").primary_lines[0].text;
-        assert!(line.starts_with("BEGINNING"));
-        assert!(line.ends_with('…'));
+        assert!(line.ends_with("NEWESTTAIL"));
+        assert!(!line.contains('…'));
         let layout_line = &block(outcome.frame.layout(), "slot-3").primary_lines[0];
         assert!(
             layout_line.width_px <= hud_content_width_px(outcome.frame.width()),
@@ -1827,7 +1827,7 @@ mod hud_frame_render_tests {
     }
 
     #[test]
-    fn hud_render_live_row_uses_leading_ellipsis_when_over_budget() {
+    fn hud_render_live_row_keeps_real_newest_text_without_ellipsis() {
         let renderer = CaptionRenderer::new_for_test().unwrap();
         let text = format!("{}NEWESTTAIL", "α".repeat(400));
         let outcome = renderer
@@ -1837,8 +1837,8 @@ mod hud_frame_render_tests {
             )]))
             .unwrap();
         let line = &block(outcome.frame.layout(), "slot-4").primary_lines[0].text;
-        assert!(line.starts_with('…'));
         assert!(line.ends_with("NEWESTTAIL"));
+        assert!(!line.contains('…'));
         let layout_line = &block(outcome.frame.layout(), "slot-4").primary_lines[0];
         assert!(
             layout_line.width_px <= hud_content_width_px(outcome.frame.width()),

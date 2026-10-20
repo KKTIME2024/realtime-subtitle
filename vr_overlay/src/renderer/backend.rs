@@ -25,8 +25,8 @@ use windows::Win32::Graphics::Direct2D::{
 };
 #[cfg(windows)]
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
-    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP,
+    D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 #[cfg(windows)]
 use windows::Win32::Graphics::Direct3D11::{
@@ -47,7 +47,7 @@ use windows::Win32::Graphics::DirectWrite::{
 #[cfg(windows)]
 use windows::Win32::Graphics::Dxgi::{
     Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-    IDXGIDevice, IDXGISurface,
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1, IDXGISurface,
 };
 #[cfg(windows)]
 use windows_numerics::{Matrix3x2, Vector2};
@@ -143,7 +143,14 @@ pub struct CaptionRenderer {
 
 impl CaptionRenderer {
     pub fn new() -> Result<Self, CaptionRenderError> {
-        Self::with_policy(CaptionLayoutPolicy::default(), BackendMode::Runtime)
+        Self::with_policy(CaptionLayoutPolicy::default(), BackendMode::Runtime(None))
+    }
+
+    pub fn new_for_dxgi_adapter(adapter_index: u32) -> Result<Self, CaptionRenderError> {
+        Self::with_policy(
+            CaptionLayoutPolicy::default(),
+            BackendMode::Runtime(Some(adapter_index)),
+        )
     }
 
     pub fn new_for_test() -> Result<Self, CaptionRenderError> {
@@ -231,7 +238,7 @@ impl CaptionRenderer {
             policy,
             presentation: RefCell::new(CaptionPresentation::default()),
             backend: RefCell::new(match backend_mode {
-                BackendMode::Runtime => RenderBackend::new_runtime()?,
+                BackendMode::Runtime(adapter_index) => RenderBackend::new_runtime(adapter_index)?,
                 BackendMode::Test => RenderBackend::new_test()?,
             }),
             hud_state: RefCell::new(HudRenderState::default()),
@@ -244,7 +251,7 @@ impl CaptionRenderer {
 }
 
 enum BackendMode {
-    Runtime,
+    Runtime(Option<u32>),
     Test,
 }
 
@@ -376,10 +383,10 @@ enum RenderBackend {
 }
 
 impl RenderBackend {
-    fn new_runtime() -> Result<Self, CaptionRenderError> {
+    fn new_runtime(adapter_index: Option<u32>) -> Result<Self, CaptionRenderError> {
         #[cfg(windows)]
         {
-            return WindowsCaptionRenderer::new().map(Self::Windows);
+            return WindowsCaptionRenderer::new(adapter_index).map(Self::Windows);
         }
 
         #[cfg(not(windows))]
@@ -393,7 +400,7 @@ impl RenderBackend {
     fn new_test() -> Result<Self, CaptionRenderError> {
         #[cfg(windows)]
         {
-            return WindowsCaptionRenderer::new().map(Self::Windows);
+            return WindowsCaptionRenderer::new(None).map(Self::Windows);
         }
 
         #[cfg(not(windows))]
@@ -572,9 +579,9 @@ impl HudTextMeasurer for DirectWriteHudTextMeasurer<'_> {
 
 #[cfg(windows)]
 impl WindowsCaptionRenderer {
-    fn new() -> Result<Self, CaptionRenderError> {
+    fn new(adapter_index: Option<u32>) -> Result<Self, CaptionRenderError> {
         let renderer_init_started = Instant::now();
-        let (device, d3d_context) = create_d3d_device()?;
+        let (device, d3d_context) = create_d3d_device(adapter_index)?;
         // GPU 同步事件查询: 绘制完成后等待 GPU 真正执行完, 再向 SteamVR
         // 提交纹理 (否则 compositor 的跨进程拷贝可能先于我们的绘制执行,
         // 读到全透明内容)。
@@ -2106,13 +2113,24 @@ fn create_d2d_factory() -> Result<ID2D1Factory1, CaptionRenderError> {
 }
 
 #[cfg(windows)]
-fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext), CaptionRenderError> {
+fn create_d3d_device(
+    adapter_index: Option<u32>,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), CaptionRenderError> {
     let feature_levels = [
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
         D3D_FEATURE_LEVEL_10_0,
     ];
+
+    if let Some(adapter_index) = adapter_index {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+            .map_err(|error| CaptionRenderError::Init(error.to_string()))?;
+        let adapter: IDXGIAdapter = unsafe { factory.EnumAdapters1(adapter_index) }
+            .and_then(|adapter| adapter.cast())
+            .map_err(|error| CaptionRenderError::Init(error.to_string()))?;
+        return create_d3d_device_inner(Some(&adapter), D3D_DRIVER_TYPE_UNKNOWN, &feature_levels);
+    }
 
     create_d3d_device_for_driver(D3D_DRIVER_TYPE_HARDWARE, &feature_levels)
         .or_else(|_| create_d3d_device_for_driver(D3D_DRIVER_TYPE_WARP, &feature_levels))
@@ -2123,12 +2141,21 @@ fn create_d3d_device_for_driver(
     driver_type: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
     feature_levels: &[windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL],
 ) -> Result<(ID3D11Device, ID3D11DeviceContext), CaptionRenderError> {
+    create_d3d_device_inner(None, driver_type, feature_levels)
+}
+
+#[cfg(windows)]
+fn create_d3d_device_inner(
+    adapter: Option<&IDXGIAdapter>,
+    driver_type: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
+    feature_levels: &[windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL],
+) -> Result<(ID3D11Device, ID3D11DeviceContext), CaptionRenderError> {
     let mut device = None;
     let mut context = None;
 
     unsafe {
         D3D11CreateDevice(
-            None,
+            adapter,
             driver_type,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -2594,7 +2621,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn line_cache_key_and_text_format_key_share_resolved_style_identity() {
-        let renderer = super::WindowsCaptionRenderer::new()
+        let renderer = super::WindowsCaptionRenderer::new(None)
             .expect("Windows caption renderer should initialize for style-key test");
         let policy = CaptionLayoutPolicy::default();
         let layout = policy
@@ -2627,7 +2654,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn line_text_format_cache_key_uses_measured_line_style_without_reresolving_text() {
-        let renderer = super::WindowsCaptionRenderer::new()
+        let renderer = super::WindowsCaptionRenderer::new(None)
             .expect("Windows caption renderer should initialize for style-key test");
         let policy = CaptionLayoutPolicy::default();
         let resolved_line_style =

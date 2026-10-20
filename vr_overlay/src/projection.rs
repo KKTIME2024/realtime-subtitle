@@ -38,18 +38,23 @@ pub fn project(state: &TranscriptState, settings: &VrViewSettings, now: Instant)
 }
 
 fn project_original(state: &TranscriptState, settings: &VrViewSettings, frame: &mut HudFrame) {
+    let segments = display_segments(state);
     let mut rows = Vec::new();
     for speaker in state.speaker_recency() {
-        let Some(record) = latest_source_record(state, speaker) else {
+        let Some(segment) = segments
+            .iter()
+            .rev()
+            .find(|segment| &segment.speaker == speaker && !segment.settled_source.is_empty())
+        else {
             continue;
         };
         rows.push(HudRow {
             role: HudRowRole::UpperPrimary,
             kind: HudRowKind::Settled,
-            text: record.source.text.clone(),
+            text: segment.settled_source.clone(),
             speaker_label: None,
-            language: record.source.language.clone(),
-            sentence: Some(record.key.clone()),
+            language: segment.settled_source_language.clone(),
+            sentence: Some(segment.latest_key.clone()),
         });
     }
     truncate_to_capacity(&mut rows, settings.max_speakers as usize);
@@ -57,18 +62,23 @@ fn project_original(state: &TranscriptState, settings: &VrViewSettings, frame: &
 }
 
 fn project_translation(state: &TranscriptState, settings: &VrViewSettings, frame: &mut HudFrame) {
+    let segments = display_segments(state);
     let mut rows = Vec::new();
     for speaker in state.speaker_recency() {
-        let Some(record) = latest_target_record(state, speaker) else {
+        let Some(segment) = segments
+            .iter()
+            .rev()
+            .find(|segment| &segment.speaker == speaker && !segment.target.is_empty())
+        else {
             continue;
         };
         rows.push(HudRow {
             role: HudRowRole::UpperPrimary,
-            kind: target_kind(record),
-            text: record.target.text.clone(),
+            kind: target_kind(segment),
+            text: segment.target.clone(),
             speaker_label: None,
-            language: record.target.language.clone(),
-            sentence: Some(record.key.clone()),
+            language: segment.target_language.clone(),
+            sentence: Some(segment.latest_key.clone()),
         });
     }
     truncate_to_capacity(&mut rows, settings.max_speakers as usize);
@@ -76,10 +86,9 @@ fn project_translation(state: &TranscriptState, settings: &VrViewSettings, frame
 }
 
 fn project_both(state: &TranscriptState, settings: &VrViewSettings, frame: &mut HudFrame) {
-    let mut selected: Vec<&SentenceRecord> = state
-        .sentences
-        .iter()
-        .filter(|record| !record.source.text.is_empty() && !record.target.text.is_empty())
+    let mut selected: Vec<DisplaySegment> = display_segments(state)
+        .into_iter()
+        .filter(|segment| !segment.paired_source.is_empty() && !segment.paired_target.is_empty())
         .collect();
     let capacity = settings.bilingual_pair_count as usize;
     if selected.len() > capacity {
@@ -98,6 +107,101 @@ fn project_both(state: &TranscriptState, settings: &VrViewSettings, frame: &mut 
             frame.slots[3] = Some(pair_source_row(newer));
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct DisplaySegment {
+    speaker: SpeakerKey,
+    latest_key: SentenceKey,
+    settled_source: String,
+    settled_source_language: Option<String>,
+    target: String,
+    target_language: Option<String>,
+    target_phase: TrackPhase,
+    paired_source: String,
+    paired_source_language: Option<String>,
+    paired_target: String,
+    paired_target_language: Option<String>,
+    paired_target_phase: TrackPhase,
+}
+
+fn display_segments(state: &TranscriptState) -> Vec<DisplaySegment> {
+    let mut segments: Vec<DisplaySegment> = Vec::new();
+    for record in &state.sentences {
+        let starts_new_segment = segments
+            .last()
+            .is_none_or(|segment| segment.speaker != record.speaker);
+        if starts_new_segment {
+            segments.push(DisplaySegment {
+                speaker: record.speaker.clone(),
+                latest_key: record.key.clone(),
+                settled_source: String::new(),
+                settled_source_language: None,
+                target: String::new(),
+                target_language: None,
+                target_phase: TrackPhase::Empty,
+                paired_source: String::new(),
+                paired_source_language: None,
+                paired_target: String::new(),
+                paired_target_language: None,
+                paired_target_phase: TrackPhase::Empty,
+            });
+        }
+
+        let segment = segments.last_mut().expect("segment was just created");
+        segment.latest_key = record.key.clone();
+        if matches!(
+            record.source.phase,
+            TrackPhase::Committed | TrackPhase::Refined
+        ) && !record.source.text.is_empty()
+        {
+            segment.settled_source.push_str(&record.source.text);
+            if record.source.language.is_some() {
+                segment
+                    .settled_source_language
+                    .clone_from(&record.source.language);
+            }
+        }
+        let pending_language = state.spec_pending_for(&record.source.text);
+        let target_text = if record.target.text.is_empty() {
+            pending_language.as_ref().map(|_| "\u{00a0}")
+        } else {
+            Some(record.target.text.as_str())
+        };
+        let target_language = record
+            .target
+            .language
+            .clone()
+            .or_else(|| pending_language.clone().flatten());
+        let target_phase = if record.target.text.is_empty() && pending_language.is_some() {
+            TrackPhase::Draft
+        } else {
+            record.target.phase
+        };
+        if let Some(target_text) = target_text {
+            segment.target.push_str(target_text);
+            if target_language.is_some() {
+                segment.target_language.clone_from(&target_language);
+            }
+            segment.target_phase = target_phase;
+        }
+        if !record.source.text.is_empty() && target_text.is_some() {
+            segment.paired_source.push_str(&record.source.text);
+            segment
+                .paired_target
+                .push_str(target_text.expect("paired target was checked"));
+            if record.source.language.is_some() {
+                segment
+                    .paired_source_language
+                    .clone_from(&record.source.language);
+            }
+            if target_language.is_some() {
+                segment.paired_target_language.clone_from(&target_language);
+            }
+            segment.paired_target_phase = target_phase;
+        }
+    }
+    segments
 }
 
 fn place_live_row(
@@ -128,31 +232,6 @@ fn place_live_row(
             }
         }
     }
-}
-
-fn latest_source_record<'a>(
-    state: &'a TranscriptState,
-    speaker: &SpeakerKey,
-) -> Option<&'a SentenceRecord> {
-    state.sentences.iter().rev().find(|record| {
-        &record.speaker == speaker
-            && matches!(
-                record.source.phase,
-                TrackPhase::Committed | TrackPhase::Refined
-            )
-            && !record.source.text.is_empty()
-    })
-}
-
-fn latest_target_record<'a>(
-    state: &'a TranscriptState,
-    speaker: &SpeakerKey,
-) -> Option<&'a SentenceRecord> {
-    state
-        .sentences
-        .iter()
-        .rev()
-        .find(|record| &record.speaker == speaker && !record.target.text.is_empty())
 }
 
 fn settled_record<'a>(
@@ -200,8 +279,14 @@ fn handoff_visible(
                 TrackPhase::Committed | TrackPhase::Refined
             ) && !record.source.text.is_empty()
         }
-        DisplayMode::Translation => !record.target.text.is_empty(),
-        DisplayMode::Both => !record.source.text.is_empty() && !record.target.text.is_empty(),
+        DisplayMode::Translation => {
+            !record.target.text.is_empty() || state.spec_pending_for(&record.source.text).is_some()
+        }
+        DisplayMode::Both => {
+            !record.source.text.is_empty()
+                && (!record.target.text.is_empty()
+                    || state.spec_pending_for(&record.source.text).is_some())
+        }
     }
 }
 
@@ -220,33 +305,37 @@ fn place_bottom_aligned(frame: &mut HudFrame, rows: Vec<HudRow>) {
     }
 }
 
-fn target_kind(record: &SentenceRecord) -> HudRowKind {
-    if record.target.phase == TrackPhase::Draft {
+fn target_kind(segment: &DisplaySegment) -> HudRowKind {
+    if segment.target_phase == TrackPhase::Draft {
         HudRowKind::Draft
     } else {
         HudRowKind::Settled
     }
 }
 
-fn pair_target_row(record: &SentenceRecord) -> HudRow {
+fn pair_target_row(segment: &DisplaySegment) -> HudRow {
     HudRow {
         role: HudRowRole::UpperPrimary,
-        kind: target_kind(record),
-        text: record.target.text.clone(),
+        kind: if segment.paired_target_phase == TrackPhase::Draft {
+            HudRowKind::Draft
+        } else {
+            HudRowKind::Settled
+        },
+        text: segment.paired_target.clone(),
         speaker_label: None,
-        language: record.target.language.clone(),
-        sentence: Some(record.key.clone()),
+        language: segment.paired_target_language.clone(),
+        sentence: Some(segment.latest_key.clone()),
     }
 }
 
-fn pair_source_row(record: &SentenceRecord) -> HudRow {
+fn pair_source_row(segment: &DisplaySegment) -> HudRow {
     HudRow {
         role: HudRowRole::UpperSecondary,
         kind: HudRowKind::Settled,
-        text: record.source.text.clone(),
+        text: segment.paired_source.clone(),
         speaker_label: None,
-        language: record.source.language.clone(),
-        sentence: Some(record.key.clone()),
+        language: segment.paired_source_language.clone(),
+        sentence: Some(segment.latest_key.clone()),
     }
 }
 

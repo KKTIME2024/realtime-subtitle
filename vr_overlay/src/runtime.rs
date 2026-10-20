@@ -367,7 +367,9 @@ impl RuntimeCoordinator {
         let potentially_visible_update = matches!(&event, CaptionEvent::SourceCommitted(value) if !value.text.is_empty())
             || matches!(&event, CaptionEvent::TargetDraft(value) if !value.text.is_empty())
             || matches!(&event, CaptionEvent::TargetCommitted(value) if !value.text.is_empty())
-            || matches!(&event, CaptionEvent::RefinedTarget(value) if !value.text.is_empty());
+            || matches!(&event, CaptionEvent::RefinedTarget(value) if !value.text.is_empty())
+            || matches!(&event, CaptionEvent::SpecPending { source, .. } if !source.trim().is_empty())
+            || matches!(&event, CaptionEvent::SpecTranslation(value) if !value.translation.is_empty());
         let frame_before = potentially_visible_update.then(|| self.project_readonly(now).frame);
         let clears_visibility = matches!(
             &event,
@@ -743,7 +745,7 @@ async fn run_overlay_inner(manifest: &OverlayManifest) -> Result<(), StartupErro
 
     let mut overlay = OpenVrOverlay::new(&manifest.overlay_instance_id)?;
     overlay.apply_calibration(&manifest.calibration)?;
-    let renderer = CaptionRenderer::new()?;
+    let renderer = CaptionRenderer::new_for_dxgi_adapter(overlay.dxgi_adapter_index()?)?;
     renderer.set_presentation(crate::renderer::CaptionPresentation {
         text_scale: manifest.calibration.text_scale,
         background_alpha: manifest.calibration.background_alpha,
@@ -864,10 +866,10 @@ async fn connect_desktop_until(
             Err(crate::protocol::BridgeError::UnsupportedPath(path)) => {
                 return Err(StartupError::Bridge(format!(
                     "bridge url path must be /ws: {path}"
-                )))
+                )));
             }
             Err(error) if Instant::now() >= deadline => {
-                return Err(StartupError::Bridge(error.to_string()))
+                return Err(StartupError::Bridge(error.to_string()));
             }
             Err(_) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -898,7 +900,7 @@ async fn reconnect_desktop_after_disconnect(
             Err(crate::protocol::BridgeError::UnsupportedPath(path)) => {
                 return Err(StartupError::Bridge(format!(
                     "bridge url path must be /ws: {path}"
-                )))
+                )));
             }
             Err(error) => {
                 let next_delay = (delay * 2).min(RECONNECT_RETRY_MAX);
@@ -977,6 +979,19 @@ async fn log_caption_event(logger: &OverlayLogger, event: &CaptionEvent) {
         CaptionEvent::TargetDraft(_) => "target_draft",
         CaptionEvent::TargetCommitted(_) => "target_committed",
         CaptionEvent::RefinedTarget(_) => "refined_target",
+        CaptionEvent::TargetConfirmed { .. } => "target_confirmed",
+        CaptionEvent::Retract { .. } => "subtitle_retract",
+        CaptionEvent::Separator { kind } => match kind {
+            crate::transcript::SeparatorKind::Punctuation => "separator_punctuation",
+            crate::transcript::SeparatorKind::Translation => "separator_translation",
+            crate::transcript::SeparatorKind::Endpoint => "separator_endpoint",
+            crate::transcript::SeparatorKind::SpeakerChange => "separator_speaker_change",
+            crate::transcript::SeparatorKind::InterruptRepair => "separator_interrupt_repair",
+            crate::transcript::SeparatorKind::Reconnect => "separator_reconnect",
+            crate::transcript::SeparatorKind::Unknown => "separator_unknown",
+        },
+        CaptionEvent::SpecPending { .. } => "spec_translation_pending",
+        CaptionEvent::SpecTranslation(_) => "spec_translation",
         CaptionEvent::Clear { .. } => "clear",
         CaptionEvent::ViewSettingsChanged(_) => "view_settings",
         CaptionEvent::Shutdown => "shutdown",
@@ -1022,6 +1037,11 @@ fn event_speaker(event: &CaptionEvent) -> Option<&SpeakerKey> {
             Some(&value.speaker)
         }
         CaptionEvent::RefinedTarget(_)
+        | CaptionEvent::TargetConfirmed { .. }
+        | CaptionEvent::Retract { .. }
+        | CaptionEvent::Separator { .. }
+        | CaptionEvent::SpecPending { .. }
+        | CaptionEvent::SpecTranslation(_)
         | CaptionEvent::Clear { .. }
         | CaptionEvent::ViewSettingsChanged(_)
         | CaptionEvent::Shutdown
@@ -1038,7 +1058,12 @@ fn event_sentence_id(event: &CaptionEvent) -> Option<&str> {
             value.sentence_id.as_deref()
         }
         CaptionEvent::RefinedTarget(value) => Some(value.sentence_id.as_str()),
-        CaptionEvent::Clear { .. }
+        CaptionEvent::TargetConfirmed { sentence_id, .. } => Some(sentence_id.as_str()),
+        CaptionEvent::Retract { sentence_id, .. } => Some(sentence_id.as_str()),
+        CaptionEvent::Separator { .. }
+        | CaptionEvent::SpecPending { .. }
+        | CaptionEvent::SpecTranslation(_)
+        | CaptionEvent::Clear { .. }
         | CaptionEvent::ViewSettingsChanged(_)
         | CaptionEvent::Shutdown
         | CaptionEvent::Activity => None,
@@ -1053,7 +1078,12 @@ fn event_text(event: &CaptionEvent) -> Option<&str> {
             Some(value.text.as_str())
         }
         CaptionEvent::RefinedTarget(value) => Some(value.text.as_str()),
+        CaptionEvent::SpecPending { source, .. } => Some(source.as_str()),
+        CaptionEvent::SpecTranslation(value) => Some(value.translation.as_str()),
         CaptionEvent::SourceEnd { .. }
+        | CaptionEvent::TargetConfirmed { .. }
+        | CaptionEvent::Retract { .. }
+        | CaptionEvent::Separator { .. }
         | CaptionEvent::Clear { .. }
         | CaptionEvent::ViewSettingsChanged(_)
         | CaptionEvent::Shutdown
